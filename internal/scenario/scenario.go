@@ -63,12 +63,30 @@ type Tenant struct {
 	Sandboxes []Sandbox `yaml:"sandboxes"`
 }
 
+const (
+	TierFree = "free"
+	TierPaid = "paid"
+)
+
+// Tiers returns each tenant's tier, which is all the guard needs from a scenario.
+func (sc *Scenario) Tiers() map[string]string {
+	tiers := map[string]string{}
+	for _, t := range sc.Tenants {
+		tiers[t.ID] = t.Tier
+	}
+	return tiers
+}
+
 type Sandbox struct {
 	ID        string        `yaml:"id"`
 	Behaviour string        `yaml:"behaviour"`
 	Start     time.Duration `yaml:"start"` // the sandbox is normal until this offset
 	Rate      int           `yaml:"rate"`  // events per second once the behaviour starts, 0 for the default
 }
+
+// Bad is the ground truth: this sandbox is meant to be contained. A bursty
+// sandbox is loud but legitimate, so it is not.
+func (s Sandbox) Bad() bool { return s.Behaviour != "normal" && s.Behaviour != "bursty" }
 
 var Behaviours = map[string]bool{
 	"normal": true, "bursty": true, "flood": true,
@@ -103,7 +121,7 @@ func (sc *Scenario) validate() error {
 	}
 	seen := map[string]bool{}
 	for _, t := range sc.Tenants {
-		if t.Tier != "free" && t.Tier != "paid" {
+		if t.Tier != TierFree && t.Tier != TierPaid {
 			return fmt.Errorf("tenant %s: tier must be free or paid, got %q", t.ID, t.Tier)
 		}
 		for _, s := range t.Sandboxes {

@@ -1,0 +1,82 @@
+# Rule set A: thresholds relative to each sandbox's own baseline, plus a
+# tenant-level limit.
+#
+# Each rule: when `expr` has been true for `for`, take `action` and keep it
+# until `ttl` after the rule last fired. `mode: shadow` records what the rule
+# would have done and changes nothing. The variables are listed in the README.
+# Numbers in arithmetic need a decimal point: 6.0 * baseline_rate.
+
+# The blast radius cap. Above it the guard stops killing and asks for a human.
+max_kills_per_minute: 3
+
+rules:
+  # A flood: far above the static limit of 100 events/s and far above what
+  # this sandbox normally does. The same expression climbs the ladder the
+  # longer it stays true. Waiting two seconds before the first real action
+  # is what protects a legitimate burst: the bursty sandbox in the demo
+  # reaches 160/s, eight times its quiet rate, but only for two seconds.
+  - name: flood-seen
+    expr: offered_rate > 100.0 && offered_rate > 6.0 * baseline_rate
+    for: 1s
+    action: observe
+    mode: enforce
+    ttl: 10s
+  - name: flood
+    expr: offered_rate > 100.0 && offered_rate > 6.0 * baseline_rate
+    for: 2s
+    action: throttle
+    rate: 10
+    mode: enforce
+    ttl: 30s
+  - name: flood-goes-on
+    expr: offered_rate > 100.0 && offered_rate > 6.0 * baseline_rate
+    for: 8s
+    action: throttle
+    rate: 0  # the cut-off
+    mode: enforce
+    ttl: 30s
+  - name: flood-never-stops
+    expr: offered_rate > 100.0 && offered_rate > 6.0 * baseline_rate
+    for: 15s
+    action: kill
+    mode: enforce
+    ttl: 1m
+
+  # A split flood: the tenant is far over what one tenant may send and over
+  # its own baseline, while this sandbox stays under the per-sandbox limit.
+  # Only the tenant-level numbers can see it.
+  - name: split-flood
+    expr: tenant_offered_rate > 200.0 && tenant_offered_rate > 3.0 * tenant_baseline_rate && offered_rate <= 100.0
+    for: 3s
+    action: throttle
+    rate: 20
+    mode: enforce
+    ttl: 30s
+
+  # Data leaving through a watched site. The long ttl is on purpose: once
+  # egress is blocked the bytes stop, so the rule goes quiet. A short ttl
+  # would let the upload resume every time it ran out.
+  - name: exfil
+    expr: watched_bytes_rate > 100000.0
+    for: 2s
+    action: block_egress
+    mode: enforce
+    ttl: 10m
+
+  # Calls to a known bad site: strong evidence, so the answer is a kill. For
+  # a paid tenant the guard blocks egress and leaves the kill to a human.
+  - name: bad-site
+    expr: bad_site_attempts >= 2.0
+    for: 2s
+    action: kill
+    mode: enforce
+    ttl: 10m
+
+  # A candidate rule, tried out in shadow before it is allowed to enforce.
+  - name: ignores-backpressure
+    expr: reject_ratio > 0.5 && offered_rate > 100.0
+    for: 5s
+    action: throttle
+    rate: 0
+    mode: shadow
+    ttl: 30s
