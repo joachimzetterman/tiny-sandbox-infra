@@ -31,7 +31,7 @@ var testScenario = &scenario.Scenario{
 
 func setup(t *testing.T) (*Launcher, context.Context) {
 	t.Helper()
-	l, err := New("tsi:dev", "http://ingest:8080")
+	l, err := New("tsi:dev", "http://ingest:8080", "http://guard:8080")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +84,16 @@ func probe(t *testing.T, l *Launcher, ctx context.Context, name string, targets 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The probes below cannot tell an isolated sandbox from one that was
+	// also put on Docker's default bridge, if the machine has no internet.
+	// So check the attachment itself: exactly the networks asked for.
+	info, err := l.cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Container.NetworkSettings.Networks; len(got) != len(endpoints) {
+		t.Fatalf("%s is attached to %d networks, want %d: %v", name, len(got), len(endpoints), got)
+	}
 	wait := l.cli.ContainerWait(ctx, id, client.ContainerWaitOptions{})
 	select {
 	case <-wait.Result:
@@ -128,6 +138,7 @@ func TestSandboxCanReachNothingButItsProxy(t *testing.T) {
 
 	forbidden := []string{
 		"ingest=" + address(t, l, ctx, "tsi-ingest-1", controlNet) + ":8080",
+		"guard=" + address(t, l, ctx, "tsi-guard-1", controlNet) + ":8080",
 		"clickhouse-native=" + address(t, l, ctx, "tsi-clickhouse-1", "tsi-storage") + ":9000",
 		"clickhouse-http=" + address(t, l, ctx, "tsi-clickhouse-1", "tsi-storage") + ":8123",
 		"fake-internet=" + address(t, l, ctx, "tsi-fakenet-1", internetNet) + ":80",
@@ -147,9 +158,9 @@ func TestSandboxCanReachNothingButItsProxy(t *testing.T) {
 	// Control: from a proxy's position the same targets are reachable. So
 	// when the sandbox fails to reach them, it is the network saying no,
 	// not a target that happens to be down.
-	control := probe(t, l, ctx, "tsi-it-control", []string{forbidden[0], "dns-ingest=dns:ingest"}, controlNet, map[string]*network.EndpointSettings{controlNet: {}})
-	if !control["ingest"] || !control["dns-ingest"] {
-		t.Fatalf("control probe cannot reach ingest, so this test would prove nothing: %v", control)
+	control := probe(t, l, ctx, "tsi-it-control", []string{forbidden[0], forbidden[1], "dns-ingest=dns:ingest"}, controlNet, map[string]*network.EndpointSettings{controlNet: {}})
+	if !control["ingest"] || !control["guard"] || !control["dns-ingest"] {
+		t.Fatalf("control probe cannot reach ingest and the guard, so this test would prove nothing: %v", control)
 	}
 
 	got := asSandbox(t, l, ctx, mine, "tsi-sandbox-it-a", append(allowed, forbidden...))
@@ -188,5 +199,54 @@ func TestSandboxWithDeadProxyCanSendNothing(t *testing.T) {
 		if reachable {
 			t.Errorf("with its proxy dead the sandbox still reached %s", name)
 		}
+	}
+}
+
+// The guard's kill, against the real engine: both containers stop, and they
+// are kept so their logs can still be read.
+func TestKillStopsTheSandboxAndItsProxy(t *testing.T) {
+	l, ctx := setup(t)
+	p := pair(t, l, ctx, 3, "it-d")
+	if _, err := l.startSandbox(ctx, "it-d", p, []string{"TSI_BEHAVIOUR=normal"}); err != nil {
+		t.Fatal(err)
+	}
+	running := func(name string) bool {
+		info, err := l.cli.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+		if err != nil {
+			t.Fatalf("%s is gone: %v", name, err)
+		}
+		return info.Container.State.Running
+	}
+	if !running("tsi-sandbox-it-d") || !running("tsi-proxy-it-d") {
+		t.Fatal("the pair is not running before the kill")
+	}
+	if err := l.Kill(ctx, "it-d"); err != nil {
+		t.Fatal(err)
+	}
+	if running("tsi-sandbox-it-d") || running("tsi-proxy-it-d") {
+		t.Error("the pair is still running after the kill")
+	}
+	// Killing what is already dead is not an error: the guard tries again
+	// whenever a killed sandbox's proxy still reports.
+	if err := l.Kill(ctx, "it-d"); err != nil {
+		t.Errorf("killing a dead pair a second time: %v", err)
+	}
+	// A sandbox that stopped by itself must not leave its proxy running.
+	p = pair(t, l, ctx, 4, "it-e")
+	if _, err := l.startSandbox(ctx, "it-e", p, []string{"TSI_BEHAVIOUR=normal"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.cli.ContainerKill(ctx, "tsi-sandbox-it-e", client.ContainerKillOptions{Signal: "SIGKILL"}); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); running("tsi-sandbox-it-e") && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := l.Kill(ctx, "it-e"); err != nil || running("tsi-proxy-it-e") {
+		t.Errorf("the sandbox had already exited: Kill returned %v, proxy running: %v", err, running("tsi-proxy-it-e"))
+	}
+	// A sandbox that does not exist is an error, which the guard logs.
+	if err := l.Kill(ctx, "it-nobody"); err == nil {
+		t.Error("killing a sandbox that does not exist reported success")
 	}
 }

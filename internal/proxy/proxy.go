@@ -5,7 +5,6 @@ package proxy
 
 import (
 	"context"
-	"log/slog"
 	"maps"
 	"net"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/clock"
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/control"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/httpx"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/scenario"
@@ -29,16 +29,20 @@ type Config struct {
 	// PeerIP is the sandbox. Any other caller is refused.
 	PeerIP    string
 	IngestURL string
-	Rate      float64 // events per second
-	Burst     int
-	Sites     scenario.Sites
-	Clock     clock.Clock
+	// GuardURL is where heartbeats go. Empty means no guard: the static
+	// limits are then the only limits.
+	GuardURL string
+	Rate     float64 // events per second
+	Burst    int
+	Sites    scenario.Sites
+	Clock    clock.Clock
 
 	// Bounds. Zero means the default set in New.
 	QueueLimit   int           // events buffered toward ingest
 	QueueBytes   int           // and their size in memory, whichever is hit first
 	ForwardBatch int           // events per request to ingest
 	ForwardEvery time.Duration // how often the buffer is drained
+	Heartbeat    time.Duration // how often counters go to the guard
 }
 
 const (
@@ -49,8 +53,8 @@ const (
 	tunnelLifetime = 60 * time.Second
 	dialTimeout    = 5 * time.Second
 	ingestTimeout  = 2 * time.Second
-	drainTimeout   = 3 * time.Second // inside the 10 s that docker stop allows
-	reportEvery    = 10 * time.Second
+	guardTimeout   = 800 * time.Millisecond // shorter than one heartbeat, so they never pile up
+	drainTimeout   = 3 * time.Second        // inside the 10 s that docker stop allows
 )
 
 type Proxy struct {
@@ -59,25 +63,17 @@ type Proxy struct {
 	queue   *event.Queue
 	classes map[string]string      // domain to site class
 	ingest  *http.Client           // toward ingest
+	guard   *http.Client           // toward the guard
 	forward *httputil.ReverseProxy // toward the fake internet
 	// dial opens outbound connections. Tests replace it to send every
 	// host name to a local server.
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	mu sync.Mutex // guards c
-	c  Counters
-}
+	started time.Time // when the counters began at zero, sent with every heartbeat
 
-// Counters only ever go up. A reader that misses a report loses nothing,
-// because the next one carries the totals.
-type Counters struct {
-	EventsAccepted uint64
-	BytesAccepted  uint64
-	Dropped        uint64                  // accepted events that ingest refused for good
-	Rejects        map[event.Reason]uint64 // refused events and requests, by reason
-	EgressBytes    map[string]uint64       // bytes both ways, by domain
-	EgressByClass  map[string]uint64       // the same bytes, by site class
-	Blocked        map[event.Reason]uint64 // refused egress attempts, by reason
+	mu     sync.Mutex // guards c and policy
+	c      control.Counters
+	policy control.Policy // the guard's last word, see heartbeat.go
 }
 
 func New(cfg Config) *Proxy {
@@ -95,14 +91,19 @@ func New(cfg Config) *Proxy {
 	if cfg.ForwardEvery == 0 {
 		cfg.ForwardEvery = 200 * time.Millisecond
 	}
+	if cfg.Heartbeat == 0 {
+		cfg.Heartbeat = time.Second
+	}
 	p := &Proxy{
 		cfg:     cfg,
 		bucket:  newBucket(cfg.Clock, cfg.Rate, cfg.Burst),
 		queue:   event.NewQueue(cfg.QueueLimit, cfg.QueueBytes),
 		classes: cfg.Sites.Classes(),
 		ingest:  &http.Client{Timeout: ingestTimeout},
+		guard:   &http.Client{Timeout: guardTimeout},
 		dial:    (&net.Dialer{Timeout: dialTimeout}).DialContext,
-		c: Counters{
+		started: cfg.Clock.Now(),
+		c: control.Counters{
 			Rejects: map[event.Reason]uint64{}, EgressBytes: map[string]uint64{},
 			EgressByClass: map[string]uint64{}, Blocked: map[event.Reason]uint64{},
 		},
@@ -112,7 +113,7 @@ func New(cfg Config) *Proxy {
 }
 
 // Counters returns a copy that is safe to read while the proxy keeps running.
-func (p *Proxy) Counters() Counters {
+func (p *Proxy) Counters() control.Counters {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c := p.c
@@ -122,7 +123,7 @@ func (p *Proxy) Counters() Counters {
 }
 
 // count runs fn with the counters locked.
-func (p *Proxy) count(fn func(c *Counters)) {
+func (p *Proxy) count(fn func(c *control.Counters)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	fn(&p.c)
@@ -145,23 +146,6 @@ func (p *Proxy) onlyPeer(next http.Handler) http.Handler {
 func (p *Proxy) EventsHandler() http.Handler { return p.onlyPeer(http.HandlerFunc(p.handleEvents)) }
 func (p *Proxy) EgressHandler() http.Handler { return p.onlyPeer(http.HandlerFunc(p.handleEgress)) }
 
-// reportLoop logs the counters every few seconds. In stage 2 the same
-// counters go to the guard as a heartbeat.
-func (p *Proxy) reportLoop(ctx context.Context) {
-	tick := time.NewTicker(reportEvery)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-			c := p.Counters()
-			slog.Info("counters", "events_accepted", c.EventsAccepted, "bytes_accepted", c.BytesAccepted, "dropped", c.Dropped,
-				"rejects", c.Rejects, "egress_by_class", c.EgressByClass, "blocked", c.Blocked)
-		}
-	}
-}
-
 // Run serves both listeners and forwards the buffer until ctx is cancelled.
 func (p *Proxy) Run(ctx context.Context) error {
 	return p.serve(ctx, net.JoinHostPort(p.cfg.ListenIP, "8080"), net.JoinHostPort(p.cfg.ListenIP, "3128"))
@@ -175,7 +159,9 @@ func (p *Proxy) serve(ctx context.Context, eventsAddr, egressAddr string) error 
 	// Go idiom: "go" starts a goroutine. This one ends when ctx is cancelled,
 	// and closing the channel tells Run that it has.
 	go func() { p.forwardLoop(ctx); close(forwarding) }()
-	go p.reportLoop(ctx)
+	if p.cfg.GuardURL != "" {
+		go p.heartbeatLoop(ctx)
+	}
 	events := &http.Server{
 		Addr: eventsAddr, Handler: p.EventsHandler(),
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second,

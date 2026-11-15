@@ -7,10 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/control"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/httpx"
 )
@@ -27,6 +30,8 @@ type Config struct {
 	QueueBytes int           // and their size, whichever is hit first. Zero means 64 MiB.
 	FlushRows  int           // flush as soon as this many are waiting
 	FlushEvery time.Duration // and at least this often
+	GuardURL   string        // where the deny list comes from. Empty means no guard.
+	DenyEvery  time.Duration // how often it is fetched. Zero means every second.
 }
 
 const (
@@ -34,17 +39,24 @@ const (
 	maxBody       = 16 << 20
 	insertTimeout = 10 * time.Second
 	drainTimeout  = 5 * time.Second // the last flush, inside the 10 s that docker stop allows
+	denyTimeout   = 800 * time.Millisecond
 )
 
 type Server struct {
 	cfg   Config
 	queue *event.Queue
 	kick  chan struct{} // tells the flusher that FlushRows was reached
+
+	mu     sync.Mutex      // guards denied
+	denied map[string]bool // sandboxes whose events are dropped
 }
 
 func New(cfg Config) *Server {
 	if cfg.QueueBytes == 0 {
 		cfg.QueueBytes = 64 << 20
+	}
+	if cfg.DenyEvery == 0 {
+		cfg.DenyEvery = time.Second
 	}
 	return &Server{cfg: cfg, queue: event.NewQueue(cfg.QueueLimit, cfg.QueueBytes), kick: make(chan struct{}, 1)}
 }
@@ -75,8 +87,27 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Enforcement must not depend on one proxy behaving. Events from a
+	// sandbox the guard killed or cut off are dropped here as well. The
+	// proxy still gets its 204, so it does not send them again.
+	s.mu.Lock()
+	denied := s.denied
+	s.mu.Unlock()
+	kept := in.Events[:0] // Go idiom: filters in place, reusing the same memory
+	var last event.Event  // the last one dropped
+	for _, e := range in.Events {
+		if denied[e.SandboxID] {
+			last = e
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if n := len(in.Events) - len(kept); n > 0 {
+		// A batch comes from one proxy, so every dropped event names the same sandbox.
+		slog.Info("dropped events of a denied sandbox", "tenant_id", last.TenantID, "sandbox_id", last.SandboxID, "events", n)
+	}
 	// The store is slow or down: push back to the proxy, do not grow.
-	if !s.queue.TryPush(in.Events) {
+	if !s.queue.TryPush(kept) {
 		httpx.Refuse(w, http.StatusTooManyRequests, event.BufferFull, time.Second)
 		return
 	}
@@ -97,6 +128,9 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 	flushing := make(chan struct{})
 	go func() { s.flushLoop(ctx); close(flushing) }()
+	if s.cfg.GuardURL != "" {
+		go s.denyLoop(ctx)
+	}
 	srv := &http.Server{Addr: s.cfg.Addr, Handler: s.Handler(), ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
 	err := httpx.Serve(ctx, srv)
 	// The listener is closed, so nothing new can arrive. Proxies already
@@ -139,4 +173,57 @@ func (s *Server) flush(ctx context.Context) {
 	}
 	s.queue.Drop(len(batch))
 	slog.Info("flushed", "rows", len(batch))
+}
+
+// denyLoop keeps the deny list fresh. If the guard cannot be reached the
+// last list stays in force: a guard that is down never loosens anything.
+func (s *Server) denyLoop(ctx context.Context) {
+	tick := time.NewTicker(s.cfg.DenyEvery)
+	defer tick.Stop()
+	down := false // used to log once per outage
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		denied, err := s.fetchDenied(ctx)
+		if err != nil {
+			if !down {
+				slog.Warn("guard unreachable, keeping the last deny list", "err", err)
+			}
+			down = true
+			continue
+		}
+		down = false
+		s.mu.Lock()
+		s.denied = denied
+		s.mu.Unlock()
+	}
+}
+
+func (s *Server) fetchDenied(ctx context.Context) (map[string]bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, denyTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.GuardURL+"/v1/deny", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var list control.DenyList
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New("guard replied " + resp.Status)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&list); err != nil {
+		return nil, err
+	}
+	denied := map[string]bool{}
+	for _, id := range list.Sandboxes {
+		denied[id] = true
+	}
+	return denied, nil
 }

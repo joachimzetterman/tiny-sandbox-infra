@@ -13,6 +13,7 @@ services:
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/tsi.xml:ro
       - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
       - ./clickhouse/usage.sql:/usage.sql:ro
+      - ./clickhouse/actions.sql:/actions.sql:ro
     mem_limit: 1500m
     ulimits:
       nofile: 262144
@@ -32,11 +33,34 @@ services:
       # The queue is bounded at 64 MiB. This tells the Go runtime to collect
       # garbage harder before the container limit is reached.
       GOMEMLIMIT: 200MiB
+      TSI_GUARD_URL: http://guard:8080  # for the deny list
     mem_limit: 256m
     networks: [control, storage]
     depends_on:
       clickhouse:
         condition: service_healthy
+
+  # Kills through the Docker API, so it has the socket, like launch. Mounting
+  # it is a local shortcut, see the README.
+  guard:
+    image: tsi:dev
+    command: [guard]
+    user: "0:0"
+    environment:
+      TSI_CLICKHOUSE_PASSWORD: tsi-local-only
+      TSI_SCENARIO: /scenarios/default.yaml  # for each tenant's tier
+      TSI_RULES: /rules/a.yaml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scenarios:/scenarios:ro
+      - ./rules:/rules:ro
+    mem_limit: 128m
+    networks: [control, storage]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      ingest:
+        condition: service_started  # only so the image is built first
 
   fakenet:
     image: tsi:dev
@@ -47,8 +71,8 @@ services:
         aliases: [allowed.test, paste.test, evil.test]
     depends_on: [ingest]  # only so the image is built first
 
-  # One-shot: `docker compose run --rm launch up`. This is the only service
-  # with the Docker socket. Mounting it is a local shortcut, see the README.
+  # One-shot: `docker compose run --rm launch`. It starts the pairs, then
+  # prints the guard's timeline. It needs the Docker socket to do the first.
   launch:
     image: tsi:dev
     profiles: [tools]

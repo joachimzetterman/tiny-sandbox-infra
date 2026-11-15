@@ -19,6 +19,8 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 - **Chose:** the guard writes one `usage` row per sandbox per second from the counters it already receives in heartbeats.
 - **Rejected:** a second write path from each proxy through ingest.
 - **Why:** one fewer path to build, bound and explain, and the proxy keeps a single upstream for control data. The cost: usage has gaps while the guard is down. Counters in heartbeats are cumulative, so the first heartbeat after an outage carries the missed totals and nothing is lost for billing, only the per-second shape.
+- **Rows hold running totals, not growth.** Rejected: writing the growth since the last row. A guard that restarted has no last row, so it would either lose everything before the restart or count it twice. With totals no state is needed to write a row.
+- **Each row also carries when its proxy started.** A proxy that restarts counts from zero again, so "the largest value seen" would lose everything before the restart. Usage is the largest value of each run, added up. Rejected: (a) taking a value that went down as a restart, in the query: it depends on row order, and misses a restart after which the counters had already passed their old values. (b) an epoch number kept by the guard: the guard forgets it when it restarts, and would then count one run twice.
 
 ## 4. One internal network per sandbox, with explicit subnets
 
@@ -75,7 +77,59 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 - **Rejected:** accepting everything and dropping a batch when the insert fails with a permanent error. That means deciding which driver errors are permanent, and a wrong guess either throws away good data or stalls again.
 - **Why:** the queue is shared by every tenant and a failed insert is retried. One event the store can never take would block everyone until a restart. Checking at the door keeps the retry loop simple: whatever is in the queue is storable, so an insert error means the store is unwell and pushing back is right.
 
-## 13. Small choices
+## 13. A sandbox is judged when its heartbeat arrives
+
+- **Chose:** the guard evaluates the rules for a sandbox inside the heartbeat request, and the reply carries the result. A timer only lifts expired actions.
+- **Rejected:** evaluating every sandbox on a one-second timer. A decision would then wait for the next tick and after that for the next heartbeat to reach the proxy: up to two seconds for nothing.
+- **Why:** policy rides on the heartbeat reply, so the fastest path from evidence to enforcement is to decide in that same round trip. In the demo the single flood is throttled 2.9 seconds after it starts: one second until a heartbeat shows it, two for the rule's `for`. It also makes replay simple: one recorded heartbeat in, one decision out, no timer to line up.
+
+## 14. A window is the last three heartbeats
+
+- **Chose:** a window is a fixed number of heartbeats (three, so two seconds). Rates divide by the real time between the first and the last.
+- **Rejected:** (a) a window of fixed duration: with heartbeats one second apart, a millisecond of jitter decides whether it holds two or three intervals, and the rates jump. (b) a longer window, say ten seconds: smoother, but a flood needs several seconds to move it, and the demo must contain one within five.
+- **Why:** two seconds smooths one odd second and still reacts at once. Telling a short burst from a flood is not the window's job, it is what `for` is for.
+
+## 15. A baseline does not learn from what a rule objects to
+
+- **Chose:** a sandbox's baseline is updated only when no rule's expression is true for any sandbox of its tenant. Its first window is taken as its normal on the same condition, and until then its baseline is zero.
+- **Rejected:** always updating. A flood that lasts long enough then becomes the new normal, "six times the baseline" stops being true, the action expires and the flood is back.
+- **Why:** the baseline is meant to describe normal behaviour, and the rules are the best available opinion on what is not. The cost: a rule that is wrong keeps the baseline frozen for as long as it fires, shadow rules included.
+- **A tenant's baseline is the sum of its sandboxes' baselines.** Rejected: a slow average of the tenant's total rate, which is what this started as. It was seeded by whichever sandbox reported first, so a tenant starting four busy sandboxes looked like a split flood, and the freeze above then made that permanent. With the sum, a sandbox that starts or leaves moves the tenant's rate and baseline together. The cost: sandboxes that are bad from their first second raise the baseline with them, so only a fixed limit catches a split flood made of new sandboxes. While a rule is firing in the tenant a new sandbox gets no baseline, so it cannot be used to dilute a flood that is under way.
+- **After a guard restart, a sandbox that comes back under a policy gets no baseline from what it is doing now.** Rejected: seeding it like a new sandbox. The first thing the new guard sees of a throttled flood is the flood, and with that as its baseline the rule never fires again. With baseline zero the fixed part of the rule decides, and a sandbox that has calmed down gets its baseline at its first quiet heartbeat. The cost: a rule with no fixed part keeps such a sandbox contained.
+
+## 16. Escalation is the same expression with a longer `for`
+
+- **Chose:** the ladder is not built into the guard. A rule set lists one rule per step: the same expression, a longer `for`, a harsher action. All actions held on a sandbox are merged and the strictest wins on each control.
+- **Rejected:** rules with a list of steps, or a variable such as `throttled` that later rules could test. Both add state to the rule language.
+- **Why:** each rule stays one line that can be read, tested and put in shadow on its own. The audit trail shows every step with the numbers it was taken on.
+
+## 17. An action hides the evidence for it
+
+- **Chose:** `ttl` is the only thing that ends an action, and the shipped `block_egress` rule has a long one (ten minutes). The proxy also checks the site class before the block, so a call to a bad site is still counted as one while egress is blocked.
+- **Rejected:** a short `ttl` everywhere. Once egress is blocked no watched bytes flow, the rule goes quiet, the block is lifted and the upload resumes until the rule fires again: a leak of a few seconds every cycle.
+- **Why:** a throttled flood keeps offering events, so its rule keeps firing and the throttle holds. A blocked upload looks cured. The guard cannot tell cured from blocked, so the `ttl` is really "how long until this sandbox gets another chance". This is the same blind spot that makes replay open loop.
+
+## 18. A kill is a decision first and a Docker call second
+
+- **Chose:** when a rule kills, the guard first marks the sandbox as killed, which cuts its events and egress by policy and puts it on the deny list, whatever happens next. Then it asks the runtime to stop the containers, with SIGKILL, sandbox first. The containers are kept, stopped.
+- **Rejected:** (a) treating the Docker call as the kill: if it fails the sandbox runs on. (b) a graceful stop: the proxy would hand over its buffer on the way out, which is not what killing means.
+- **Why:** fail closed. The Docker socket is the least reliable thing the guard touches, so containment must not depend on it. Keeping the containers means their logs can still be read.
+- **A heartbeat from a killed sandbox is the sign that the kill did not take**, and the guard then asks the runtime again, at most every 10 seconds. Both containers are tried each time, and one that already stopped is not an error. Rejected: a retry timer of its own. The heartbeat is the evidence, and when it stops there is nothing left to kill.
+- **Once a sandbox is killed no further rule is run against it.** Two kill rules that fire on the same heartbeat would otherwise kill it twice and use two slots of the blast radius cap.
+
+## 19. What the guard does when it knows too little
+
+- **A rule without `mode` is shadow.** Rejected: defaulting to enforce. A new rule should have to say that it may act.
+- **A tenant without a tier is treated as paid.** Rejected: free. A kill cannot be taken back, so the guard does not kill what it cannot place.
+- **A restarted guard takes over what each proxy enforces**, for 30 seconds. Rejected: answering "no restrictions" until the rules fire again, which would loosen every limit on every restart. What this means for baselines is in decision 15.
+- **`buffer_full` is not held against a sandbox.** It is left out of `reject_ratio` and `offered_rate`. Rejected: counting every refusal. A slow ingest would then make every tenant look like an attacker.
+- **A kill that automation may not carry out becomes `block_egress`**, for a paid tenant and for a kill over the blast radius cap alike. Rejected: (a) doing nothing when the cap refuses, which left the fourth sandbox calling a bad site fully open while a paid one doing the same was blocked. (b) the full cut-off: a wrong rule firing everywhere would then discard every tenant's events, which is the damage the cap is there to limit. Blocking egress stops the harm to others and keeps the tenant's data.
+- **A kill refused by the blast radius cap is tried again** when the minute has room, while its rule still fires. Rejected: dropping it. The cap is a speed limit, not a pardon.
+- **A throttle rule must say its rate.** Rejected: a default. Left out, it used to read as zero, which is the cut-off.
+- **A sandbox silent for a minute, with nothing held against it, is forgotten.** Rejected: remembering every sandbox ever seen: the limit of 10,000 would then fill up for good and every new sandbox would go unjudged and unbilled. A kill is remembered for its `ttl`. A sandbox that comes back is admitted like a new one, and if its proxy still enforces a policy, like one from before a restart.
+- **A store that is down delays the audit trail, not the guard.** Rows wait in memory up to a limit. Rejected: refusing to act without a written record. Every decision is also a log line.
+
+## 20. Small choices
 
 
 - **Settings by environment variable**, not flags or config files: it is what a container gets most easily, and a missing, unparsable, zero or negative limit falls back to the default limit, never to no limit or a crash.
@@ -83,3 +137,6 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 - **The proxy checks the caller's address** although the network already guarantees it: one `if`, and it turns a future mistake in the network layout into a refusal and not a leak.
 - **The build image is pinned to the exact Go version in `go.mod`**: a floating tag can resolve to an older cached image and fail the build.
 - **Start offsets count from each sandbox's own start**, not a shared clock: no coordination needed, and launch knows when it started each one.
+- **`for` is compared with half a second of slack.** Heartbeats are a second apart give or take a millisecond, and without slack that millisecond decides whether a rule fires now or a second later.
+- **The guard kills through the launcher's Docker code**, not a client of its own: the code that names and builds a pair is the code that stops it.
+- **The timeline is polled from the guard by `launch`**, not read from ClickHouse: launch is not on the storage network, and it already knows when each behaviour starts.
