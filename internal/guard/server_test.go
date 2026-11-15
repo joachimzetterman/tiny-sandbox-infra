@@ -90,14 +90,14 @@ func TestStoreThatIsDownDelaysTheRecordAndNotTheGuard(t *testing.T) {
 	h.g.cfg.Sink = sink
 	h.add("t1", "s1")
 	h.run(3, steady(500))
-	h.g.flush(context.Background())
+	h.g.Flush(context.Background())
 	// The guard decided and acted although nothing could be written.
 	if len(h.runtime.Killed) != 1 || len(sink.actions) != 0 {
 		t.Fatalf("killed %v, rows written %d", h.runtime.Killed, len(sink.actions))
 	}
 
 	sink.fail = false
-	h.g.flush(context.Background())
+	h.g.Flush(context.Background())
 	if len(sink.actions) != 1 || len(sink.usage) != 3 {
 		t.Fatalf("after the store came back: %d decisions and %d usage rows, want 1 and 3", len(sink.actions), len(sink.usage))
 	}
@@ -105,7 +105,7 @@ func TestStoreThatIsDownDelaysTheRecordAndNotTheGuard(t *testing.T) {
 	if last := sink.usage[2]; last.TenantID != "t1" || last.SandboxID != "s1" || last.Counters.EventsAccepted != 1500 {
 		t.Errorf("usage row %+v", last)
 	}
-	h.g.flush(context.Background())
+	h.g.Flush(context.Background())
 	if len(sink.actions) != 1 || len(sink.usage) != 3 {
 		t.Errorf("rows were written twice: %d decisions, %d usage rows", len(sink.actions), len(sink.usage))
 	}

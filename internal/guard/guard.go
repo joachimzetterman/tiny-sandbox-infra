@@ -1,12 +1,13 @@
 // Package guard watches every sandbox through its proxy's heartbeats and
 // contains the ones that misbehave. window.go turns counters into rates,
-// rules.go holds the rule language, this file decides, and server.go is the
-// HTTP and storage around it.
+// rules.go holds the rule language, this file decides, server.go is the
+// HTTP and storage around it, and recorder.go keeps what it saw for replay.
 package guard
 
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"maps"
 	"slices"
@@ -37,7 +38,8 @@ type Config struct {
 	Rules   *RuleSet
 	Tiers   map[string]string // tenant to tier
 	Runtime Runtime
-	Sink    Sink // may be nil: nothing is stored
+	Sink    Sink      // may be nil: nothing is stored
+	Record  io.Writer // may be nil: nothing is recorded. See recorder.go.
 	Clock   clock.Clock
 }
 
@@ -107,6 +109,7 @@ type Guard struct {
 	actions   []Decision // waiting for the store
 	usage     []Usage    // waiting for the store
 	lost      int        // rows dropped because the store fell behind
+	recorded  int        // bytes written to the recording
 }
 
 type tenant struct {
@@ -151,6 +154,7 @@ func (g *Guard) Heartbeat(hb control.Heartbeat) (control.Policy, error) {
 		s = g.admit(hb, now)
 	}
 	s.window.add(now, hb.Counters)
+	g.tape(now, hb)
 	if len(g.usage) < maxPending {
 		g.usage = append(g.usage, Usage{At: now, TenantID: s.tenantID, SandboxID: s.id, Started: hb.Started, Counters: hb.Counters})
 	} else {

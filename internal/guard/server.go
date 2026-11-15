@@ -71,7 +71,7 @@ func (g *Guard) Run(ctx context.Context) error {
 	<-looping
 	last, stop := context.WithTimeout(context.Background(), flushTimeout)
 	defer stop()
-	g.flush(last) // the audit trail of the last seconds
+	g.Flush(last) // the audit trail of the last seconds
 	return err
 }
 
@@ -86,16 +86,16 @@ func (g *Guard) loop(ctx context.Context) {
 		case <-sweep.C:
 			g.Sweep()
 		case <-flush.C:
-			g.flush(ctx)
+			g.Flush(ctx)
 		}
 	}
 }
 
-// flush writes the waiting rows. Rows leave memory only after the store
+// Flush writes the waiting rows. Rows leave memory only after the store
 // took them. If the store is down they wait, up to maxPending, and the
 // guard keeps deciding: containment matters more than the record of it,
 // and every decision is in the log as well.
-func (g *Guard) flush(ctx context.Context) {
+func (g *Guard) Flush(ctx context.Context) {
 	if g.cfg.Sink == nil {
 		return
 	}
