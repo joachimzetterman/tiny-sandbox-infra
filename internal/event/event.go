@@ -24,6 +24,8 @@ const (
 	SiteUnlisted  Reason = "site_unlisted"   // egress to a domain in no site class
 	ForbiddenPeer Reason = "forbidden_peer"  // caller is not this proxy's sandbox
 	UpstreamError Reason = "upstream_error"  // the remote host could not be reached
+	EgressBlocked Reason = "egress_blocked"  // the guard has blocked this sandbox's egress
+	GuardFull     Reason = "guard_full"      // the guard tracks as many sandboxes as it can
 )
 
 const (

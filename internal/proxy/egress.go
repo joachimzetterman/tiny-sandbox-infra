@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/control"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/httpx"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/scenario"
@@ -33,8 +34,15 @@ func (p *Proxy) handleEgress(w http.ResponseWriter, r *http.Request) {
 	case scenario.ClassUnlisted:
 		p.block(w, http.StatusForbidden, event.SiteUnlisted, host)
 	default:
+		// Checked after the site class, so a call to a bad site is still
+		// counted as one while egress is blocked. The rule that blocked it
+		// keeps seeing the evidence.
+		if p.Policy().BlockEgress {
+			p.block(w, http.StatusForbidden, event.EgressBlocked, host)
+			return
+		}
 		add := func(n int) {
-			p.count(func(c *Counters) { c.EgressBytes[host] += uint64(n); c.EgressByClass[class] += uint64(n) })
+			p.count(func(c *control.Counters) { c.EgressBytes[host] += uint64(n); c.EgressByClass[class] += uint64(n) })
 		}
 		if r.Method == http.MethodConnect {
 			p.tunnel(w, r, add)
@@ -57,7 +65,7 @@ func (p *Proxy) handleEgress(w http.ResponseWriter, r *http.Request) {
 
 // block refuses an outbound call before anything leaves, and counts it.
 func (p *Proxy) block(w http.ResponseWriter, status int, reason event.Reason, host string) {
-	p.count(func(c *Counters) { c.Blocked[reason]++ })
+	p.count(func(c *control.Counters) { c.Blocked[reason]++ })
 	slog.Info("egress blocked", "reason", reason, "host", host)
 	httpx.Refuse(w, status, reason, 0)
 }
@@ -89,7 +97,7 @@ func (p *Proxy) newForwarder() *httputil.ReverseProxy {
 			// host is fine, and sending the same request again cannot work.
 			var tooBig *http.MaxBytesError
 			if errors.As(err, &tooBig) {
-				p.count(func(c *Counters) { c.Blocked[event.BodyTooLarge]++ })
+				p.count(func(c *control.Counters) { c.Blocked[event.BodyTooLarge]++ })
 				httpx.Refuse(w, http.StatusRequestEntityTooLarge, event.BodyTooLarge, 0)
 				return
 			}

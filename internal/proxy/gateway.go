@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/control"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/httpx"
 )
@@ -72,7 +73,7 @@ func (p *Proxy) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// Bad events are counted only here, once the request has its final
 	// answer. A 429 is retried, and counting on every attempt would inflate
 	// the numbers the guard reads.
-	p.count(func(c *Counters) {
+	p.count(func(c *control.Counters) {
 		c.EventsAccepted += uint64(len(good))
 		c.BytesAccepted += size
 		for _, r := range bad {
@@ -86,7 +87,7 @@ func (p *Proxy) handleEvents(w http.ResponseWriter, r *http.Request) {
 // lists the events that would be refused anyway, so the producer can fix
 // them before it retries.
 func (p *Proxy) refuseEvents(w http.ResponseWriter, status int, reason event.Reason, n int, retryAfter time.Duration, bad ...event.Rejected) {
-	p.count(func(c *Counters) { c.Rejects[reason] += uint64(n) })
+	p.count(func(c *control.Counters) { c.Rejects[reason] += uint64(n) })
 	httpx.Refuse(w, status, reason, retryAfter, bad...)
 }
 
@@ -120,7 +121,7 @@ func (p *Proxy) forwardOnce(ctx context.Context) bool {
 		// Retrying would block everything behind this batch forever. Losing
 		// it is the lesser harm, and it is counted and logged loudly.
 		slog.Error("ingest refused a batch for good, dropping it", "events", len(batch))
-		p.count(func(c *Counters) { c.Dropped += uint64(len(batch)) })
+		p.count(func(c *control.Counters) { c.Dropped += uint64(len(batch)) })
 	} else if err != nil {
 		slog.Warn("forward to ingest failed, will retry", "err", err, "events", len(batch))
 		return false
