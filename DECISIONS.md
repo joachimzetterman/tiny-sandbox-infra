@@ -36,12 +36,14 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 - **Chose:** the proxy and ingest each hold a bounded queue. A batch is read with Peek, sent, and removed with Drop only after the next hop accepted it. A failed send is retried with the same events.
 - **Rejected:** (a) dropping a batch when the send fails: simple, but a short ingest outage silently loses accepted data. (b) a durable queue between proxy and ingest: the right answer at real scale and a non-goal here.
 - **Why:** once the gateway answered 200 the event is ours to keep. The cost is duplicates: if ingest stores a batch and the reply is lost, the proxy sends it again. `event_id` is assigned once at the gateway, so duplicates share an ID and can be removed at read time. The demo does not deduplicate.
+- **Two edges:** on a normal stop, a proxy and ingest first close their listeners and then hand over what they still hold, within a few seconds. And a batch that ingest refuses with a 4xx other than 429 is dropped, counted and logged, not retried: it can never succeed, and retrying would block every event behind it.
 
 ## 7. A batch that does not fit the token bucket is refused whole
 
 - **Chose:** if the valid events in a request need more tokens than the bucket has, the whole request gets a 429 with `Retry-After`.
 - **Rejected:** accepting as many events as there are tokens and refusing the rest.
 - **Why:** a producer that gets "all or nothing" has one simple rule: wait, then resend the same request. Partial acceptance needs per-event bookkeeping on both sides. A batch larger than the bucket could never succeed, so it gets `batch_too_large` and not `rate_limited`, which would invite a pointless retry.
+- **What a refusal costs:** nothing. If the buffer turns out to be full the tokens are given back, and bad events in a refused batch are counted only when the batch finally gets its 200. Counting them on every attempt would inflate the reject numbers the guard reads. The 429 still lists them, so the producer can fix them before it retries.
 
 ## 8. Compose runs the fixed parts, launch runs the pairs
 
@@ -61,9 +63,23 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 - **Rejected:** generating a throwaway certificate in `fakenet` and having the simulated sandbox skip verification.
 - **Why:** about 40 lines that would show nothing new. For a tunnel the proxy can only see the host name and count bytes, and both are covered by the test. The limit is stated in the README: the live demo never opens a tunnel.
 
-## 11. Small choices
+## 11. Queues are bounded in bytes as well as in events
 
-- **Settings by environment variable**, not flags or config files: it is what a container gets most easily, and a missing or unparsable limit falls back to the default limit, never to no limit.
+- **Chose:** every queue has two limits, a number of events and a number of bytes, and refuses a push that would pass either. Ingest also gets `GOMEMLIMIT` below its container limit.
+- **Rejected:** a limit in events only. 50,000 events of 4 KiB are about 205 MB, in a container that is allowed 256 MB.
+- **Why:** memory is what runs out, and an event can be 30 bytes or 4 KiB. With an event limit alone, a slow ClickHouse would get ingest killed before it ever answered 429. The event limit stays because it keeps one insert a predictable size.
+
+## 12. Ingest checks what it receives
+
+- **Chose:** ingest refuses a batch that contains an event no proxy would send (no tenant, no sandbox, no time, an ID that is not a UUID, an unknown type, an oversized payload).
+- **Rejected:** accepting everything and dropping a batch when the insert fails with a permanent error. That means deciding which driver errors are permanent, and a wrong guess either throws away good data or stalls again.
+- **Why:** the queue is shared by every tenant and a failed insert is retried. One event the store can never take would block everyone until a restart. Checking at the door keeps the retry loop simple: whatever is in the queue is storable, so an insert error means the store is unwell and pushing back is right.
+
+## 13. Small choices
+
+
+- **Settings by environment variable**, not flags or config files: it is what a container gets most easily, and a missing, unparsable, zero or negative limit falls back to the default limit, never to no limit or a crash.
 - **UUIDv7 written by hand** (about 10 lines), not a dependency: the standard library has no UUID type and the layout is fixed by RFC 9562.
 - **The proxy checks the caller's address** although the network already guarantees it: one `if`, and it turns a future mistake in the network layout into a refusal and not a leak.
+- **The build image is pinned to the exact Go version in `go.mod`**: a floating tag can resolve to an older cached image and fail the build.
 - **Start offsets count from each sandbox's own start**, not a shared clock: no coordination needed, and launch knows when it started each one.

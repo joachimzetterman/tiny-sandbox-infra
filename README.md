@@ -46,7 +46,7 @@ Everything is one binary, `tsi`, with one role per subcommand.
 
 ### What the proxy enforces
 
-**Event gateway.** For every batch: overwrite `tenant_id` and `sandbox_id` with the values the proxy was started with, assign `event_id` (UUIDv7), clamp `event_time` to now plus or minus one hour, refuse unknown types and oversized payloads, apply a token bucket, then buffer toward ingest. The buffer is bounded: when it is full the gateway answers 429.
+**Event gateway.** For every batch: overwrite `tenant_id` and `sandbox_id` with the values the proxy was started with, assign `event_id` (UUIDv7), clamp `event_time` to now plus or minus one hour, refuse unknown types and oversized payloads, apply a token bucket, then buffer toward ingest. The buffer is bounded in events and in bytes: when it is full the gateway answers 429 and gives the tokens back.
 
 **Egress proxy.** A forward proxy for HTTP and HTTPS (CONNECT). Every domain has a site class, set in the scenario file:
 
@@ -57,16 +57,18 @@ Everything is one binary, `tsi`, with one role per subcommand.
 | `bad` | Blocked, and every attempt is counted. |
 | unlisted | Blocked. Default deny. |
 
+Bytes means everything the sandbox sends: the request line, the headers and the body, plus the reply body. Host names are matched without regard to case or a trailing dot.
+
 **Reason codes.** Every refusal carries a machine-readable reason, so a well-behaved producer can fix itself instead of retrying forever.
 
 | Reason | Status | Meaning |
 |---|---|---|
-| `malformed` | 400 | Body is not valid JSON. |
-| `body_too_large` | 413 | Request body over 1 MiB. |
+| `malformed` | 400 | Body is not valid JSON. Ingest also answers this for an event no proxy would send. |
+| `body_too_large` | 413 | Event request over 1 MiB, or an outbound upload over 8 MiB. |
 | `batch_too_large` | 413 | More events than the token bucket can ever hold. Retrying will not help. |
 | `unknown_type` | 200, per event | Event type is not in the schema. |
 | `oversized_event` | 200, per event | Payload over 4 KiB. |
-| `rate_limited` | 429 | Token bucket is empty. `Retry-After` says how long to wait. |
+| `rate_limited` | 429 | Token bucket is empty. `Retry-After` says how long to wait. The reply also lists events that would be refused anyway. |
 | `buffer_full` | 429 | Ingest is slow. `Retry-After` is set. |
 | `site_bad`, `site_unlisted` | 403 | Egress refused by site class. |
 | `forbidden_peer` | 403 | The caller is not this proxy's sandbox. |
@@ -93,22 +95,22 @@ If a proxy dies, its sandbox's only link has nothing behind it: fail closed, by 
  1. │ t01       │         1 │   1258 │ 147.42 KiB    │   normal
 10. │ t10       │         1 │   2216 │ 259.69 KiB    │   bursty, paid
 11. │ t11       │         1 │   5198 │ 609.14 KiB    │   flood from 10 s
-12. │ t12       │         1 │   1212 │ 142.03 KiB    │   exfil from 20 s
+12. │ t12       │         1 │   1214 │ 142.27 KiB    │   exfil from 20 s
 13. │ t13       │         1 │   1210 │ 141.80 KiB    │   baddest from 30 s
-15. │ t15       │         3 │   7785 │ 912.30 KiB    │   split flood from 40 s
+15. │ t15       │         3 │   7767 │ 910.20 KiB    │   split flood from 40 s
     └───────────┴───────────┴────────┴───────────────┘
 ```
 
-(Rows trimmed and annotated by hand.) Every sandbox claims to be tenant `someone-else` in every event. No such tenant appears.
+(Rows and fields trimmed and annotated by hand.) Every sandbox claims to be tenant `someone-else` in every event. No such tenant appears.
 
 Then what each proxy counted:
 
 ```
-"sandbox_id":"s01","events_accepted":1198,"rejects":{},"egress_by_class":{"trusted":840},"blocked":{}
-"sandbox_id":"s11","events_accepted":5198,"rejects":{"rate_limited":95000},"egress_by_class":{"trusted":840},"blocked":{}
-"sandbox_id":"s12","events_accepted":1196,"rejects":{},"egress_by_class":{"trusted":840,"watched":41945520},"blocked":{}
-"sandbox_id":"s13","events_accepted":1198,"rejects":{},"egress_by_class":{"trusted":840},"blocked":{"site_bad":60}
-"sandbox_id":"s15","events_accepted":2598,"rejects":{},"egress_by_class":{"trusted":840},"blocked":{}
+"sandbox_id":"s01","events_accepted":1198,"dropped":0,"rejects":{},"egress_by_class":{"trusted":2940},"blocked":{}
+"sandbox_id":"s11","events_accepted":5198,"dropped":0,"rejects":{"rate_limited":95000},"egress_by_class":{"trusted":2940},"blocked":{}
+"sandbox_id":"s12","events_accepted":1198,"dropped":0,"rejects":{},"egress_by_class":{"trusted":2940,"watched":41953120},"blocked":{}
+"sandbox_id":"s13","events_accepted":1198,"dropped":0,"rejects":{},"egress_by_class":{"trusted":2940},"blocked":{"site_bad":60}
+"sandbox_id":"s15","events_accepted":2598,"dropped":0,"rejects":{},"egress_by_class":{"trusted":2940},"blocked":{}
 ```
 
 This is the picture stage 1 leaves, and the reason stage 2 exists:
@@ -129,6 +131,10 @@ The live timeline (stage 2) and the A/B report (stage 3) will be pasted here whe
 - `event_time` is clamped
 - unlisted and `bad` domains are blocked, including an IP literal and a look-alike name
 - a slow ingest produces 429s and the buffer never passes its limit, and nothing accepted is lost when ingest recovers
+- a refused request costs no tokens, and a retried batch does not count its bad events twice
+- data sent in a URL or a header is counted, and an upload over the limit is refused before any of it leaves
+- an event the store could never take is refused by ingest and never enters the shared queue
+- stopping a proxy or ingest writes out what was already acknowledged
 - a well-behaved sandbox backs off on 429 and a flood does not
 
 `make test-integration` needs a Docker engine. It starts real pairs and proves:
@@ -151,6 +157,7 @@ These are relative numbers from one laptop, not capacity claims. x86 has not bee
 - **Numbers are relative comparisons on a laptop**, not capacity claims.
 - **No authentication between components** (a stated non-goal). Ingest believes any caller on the control network. In production each proxy would have an identity and ingest would check that a batch's tenant matches it.
 - **Delivery is at least once.** A lost reply makes the proxy resend a batch. Duplicates share an `event_id`; the demo does not remove them.
+- **Buffers are in memory.** A normal stop writes them out first. A crash or a kill loses what a proxy or ingest was still holding, including events already answered with a 200.
 - **The live demo never opens an HTTPS tunnel.** The fake hosts speak plain HTTP. CONNECT is covered by a unit test.
 - **The egress proxy sees host names and byte counts only.** It does not inspect content, and for a tunnel it trusts the host name in the CONNECT line.
 - **Replay is open loop** (stage 3): it cannot model how an action would have changed later traffic.
