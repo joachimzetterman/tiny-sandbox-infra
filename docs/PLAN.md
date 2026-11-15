@@ -1,6 +1,6 @@
 # Plan
 
-Status: repo bootstrapped, no code written yet. Waiting for confirmation of the spec readings below.
+Status: approved. Stage 1 in progress.
 
 This file is the plan agreed before stage 1. The original brief is [SPEC.md](SPEC.md). Once code exists, `DECISIONS.md` is the source of truth for tradeoffs.
 
@@ -78,13 +78,15 @@ Compose runs the fixed parts (ClickHouse, ingest, guard, fake internet). `launch
 
 Rough budget: stage 1 about 1,100 lines, stage 2 about 750, stage 3 about 300. That is slightly over 2,000. First cuts if needed: TLS on the fake hosts, timeline formatting, `rejectstorm` (it is not in the default scenario).
 
-## Spec readings I want you to confirm
+## Spec readings, as agreed
 
-1. **Allowlist versus `exfil`.** A strict allowlist blocks an upload to an unknown domain on byte zero, so "egress bytes sent before the block" would always be 0. Proposal: allowlist entries carry a class. `trusted` (`allowed.test`) and `watched` (`paste.test`: reachable, counted separately, this is the "unknown domain"). Anything unlisted is blocked and counted. `evil.test` is tagged `bad` so a rule can tell known bad from merely unlisted.
-2. **"Cut off".** The deny list says "cut off or killed" but the ladder has no such step. Reading: `block_egress` is the cut-off. The proxy refuses all egress and all events (reason `cut_off`), and ingest drops that sandbox's events as the backstop.
-3. **Usage query.** Rejects and egress bytes are not in `events`. Proposal: a third small table `usage`, one row per sandbox per second, written by the proxy through ingest. Metering then works in stage 1 and with the guard down.
-4. **Fake internet.** A seventh subcommand `tsi fakenet` (about 50 lines) keeps one binary and one image.
-5. **Docker tests.** The two isolation tests need a Docker engine. `make test` stays Docker-free; `make test-integration` runs them, and CI runs both.
+The brief was updated to match these. Entries 1 to 3 have their reasoning in `DECISIONS.md`.
+
+1. **Site classes.** Config sets each domain's class: `trusted`, `watched` or `bad`, with default deny. Watched bytes and bad-site attempts are rule variables.
+2. **Two independent controls.** `block_egress` only stops outbound calls. "Cut off" means `throttle` with rate zero. The ingest deny list is killed sandboxes plus zero-rate sandboxes.
+3. **Usage table.** The guard writes it from the counters it already receives. This moves the usage table and query to stage 2.
+4. **Fake internet.** A seventh subcommand, `tsi fakenet`.
+5. **Docker tests.** `make test` stays Docker-free. `make test-integration` runs the two isolation tests, and CI runs both.
 
 ## Things in the spec that will not work as written
 
