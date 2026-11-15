@@ -18,7 +18,9 @@ type subject struct {
 	sandbox   scenario.Sandbox
 	onset     time.Time     // when its behaviour starts
 	announced bool          // "begins" was printed
-	contained time.Duration // onset to the first enforced action, negative if none
+	acted     bool          // an action was enforced after onset
+	contained time.Duration // onset to the first such action
+	wronged   bool          // an action was enforced while it was well behaved
 }
 
 // Watch prints the guard's decisions as they happen for the given time,
@@ -30,7 +32,7 @@ func (l *Launcher) Watch(ctx context.Context, sc *scenario.Scenario, length time
 	byID := map[string]*subject{}
 	for _, t := range sc.Tenants {
 		for _, s := range t.Sandboxes {
-			sub := &subject{tenant: t, sandbox: s, onset: l.started[s.ID].Add(s.Start), contained: -1}
+			sub := &subject{tenant: t, sandbox: s, onset: l.started[s.ID].Add(s.Start)}
 			subjects = append(subjects, sub)
 			byID[s.ID] = sub
 		}
@@ -68,11 +70,15 @@ func (l *Launcher) Watch(ctx context.Context, sc *scenario.Scenario, length time
 			}
 			text := describe(d) + "  (rule " + d.Rule + ")"
 			enforced := d.Effect == guard.Throttle || d.Effect == guard.BlockEgress || d.Effect == guard.Kill
-			if enforced && sub.contained < 0 {
-				sub.contained = d.At.Sub(sub.onset)
-				if sub.sandbox.Bad() {
-					text += fmt.Sprintf("  %.1f s after onset", sub.contained.Seconds())
-				}
+			switch after := d.At.Sub(sub.onset); {
+			case !enforced:
+			case !sub.sandbox.Bad() || after < 0:
+				// Also a bad sandbox, if it had not started misbehaving yet.
+				sub.wronged = true
+				text += "  FALSE POSITIVE"
+			case !sub.acted:
+				sub.acted, sub.contained = true, after
+				text += fmt.Sprintf("  %.1f s after onset", after.Seconds())
 			}
 			line(d.At, sub, text)
 		}
@@ -81,16 +87,23 @@ func (l *Launcher) Watch(ctx context.Context, sc *scenario.Scenario, length time
 	fmt.Fprintln(out, "\nSummary")
 	good, touched := 0, 0
 	for _, sub := range subjects {
+		id, what, bad := sub.sandbox.ID, sub.sandbox.Behaviour, sub.sandbox.Bad()
 		switch {
-		case sub.sandbox.Bad() && sub.contained >= 0:
-			fmt.Fprintf(out, "  %-4s %-8s contained %.1f s after onset\n", sub.sandbox.ID, sub.sandbox.Behaviour, sub.contained.Seconds())
-		case sub.sandbox.Bad():
-			fmt.Fprintf(out, "  %-4s %-8s NOT contained\n", sub.sandbox.ID, sub.sandbox.Behaviour)
-		case sub.contained >= 0:
-			good, touched = good+1, touched+1
-			fmt.Fprintf(out, "  %-4s %-8s FALSE POSITIVE: a well-behaved sandbox was acted on\n", sub.sandbox.ID, sub.sandbox.Behaviour)
-		default:
+		case sub.acted:
+			fmt.Fprintf(out, "  %-4s %-8s contained %.1f s after onset\n", id, what, sub.contained.Seconds())
+		case bad && !sub.wronged:
+			fmt.Fprintf(out, "  %-4s %-8s NOT contained\n", id, what)
+		case bad:
+			fmt.Fprintf(out, "  %-4s %-8s no new action after onset\n", id, what)
+		}
+		if sub.wronged {
+			fmt.Fprintf(out, "  %-4s %-8s FALSE POSITIVE: acted on while it was well behaved\n", id, what)
+		}
+		if !bad {
 			good++
+		}
+		if !bad && sub.wronged {
+			touched++
 		}
 	}
 	fmt.Fprintf(out, "  neighbours: %d well-behaved sandboxes, %d throttled, blocked or killed\n\n", good, touched)
@@ -107,7 +120,7 @@ func describe(d guard.Decision) string {
 	case d.Note == guard.NoteShadow:
 		return "would " + d.Action + " (shadow, nothing changed)"
 	case d.Note == guard.NoteBlastRadius:
-		return "kill refused: blast radius cap, a human is needed"
+		return "egress blocked, kill refused: blast radius cap, a human is needed"
 	case d.Note == guard.NoteApproval:
 		return "egress blocked, kill left to a human (paid tenant)"
 	case d.Effect == guard.Observe:
@@ -135,6 +148,9 @@ func (l *Launcher) decisions(ctx context.Context, seq uint64) ([]guard.Decision,
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// Decoded before the return statement: Go does not say whether a
+	// return reads the variable before or after a call that fills it.
 	var decisions []guard.Decision
-	return decisions, json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&decisions)
+	err = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&decisions)
+	return decisions, err
 }

@@ -226,6 +226,25 @@ func TestKillStopsTheSandboxAndItsProxy(t *testing.T) {
 	if running("tsi-sandbox-it-d") || running("tsi-proxy-it-d") {
 		t.Error("the pair is still running after the kill")
 	}
+	// Killing what is already dead is not an error: the guard tries again
+	// whenever a killed sandbox's proxy still reports.
+	if err := l.Kill(ctx, "it-d"); err != nil {
+		t.Errorf("killing a dead pair a second time: %v", err)
+	}
+	// A sandbox that stopped by itself must not leave its proxy running.
+	p = pair(t, l, ctx, 4, "it-e")
+	if _, err := l.startSandbox(ctx, "it-e", p, []string{"TSI_BEHAVIOUR=normal"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.cli.ContainerKill(ctx, "tsi-sandbox-it-e", client.ContainerKillOptions{Signal: "SIGKILL"}); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); running("tsi-sandbox-it-e") && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := l.Kill(ctx, "it-e"); err != nil || running("tsi-proxy-it-e") {
+		t.Errorf("the sandbox had already exited: Kill returned %v, proxy running: %v", err, running("tsi-proxy-it-e"))
+	}
 	// A sandbox that does not exist is an error, which the guard logs.
 	if err := l.Kill(ctx, "it-nobody"); err == nil {
 		t.Error("killing a sandbox that does not exist reported success")

@@ -60,7 +60,10 @@ func (p *Proxy) beat(ctx context.Context) (policy control.Policy, err error) {
 	if resp.StatusCode != http.StatusOK {
 		return policy, fmt.Errorf("guard replied %s", resp.Status)
 	}
-	return policy, json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&policy)
+	// Decoded before the return statement: Go does not say whether a
+	// return reads the variable before or after a call that fills it.
+	err = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&policy)
+	return policy, err
 }
 
 // apply puts a policy in force. A throttle can only lower the static rate,

@@ -5,6 +5,7 @@ package launch
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -26,6 +27,9 @@ const (
 	labelManaged = "tsi.managed"
 	controlNet   = "tsi-control"  // proxies, ingest, guard
 	internetNet  = "tsi-internet" // proxies and the fake internet
+	// killEach bounds the kill of one container, so a call that hangs on
+	// the sandbox cannot use up the time meant for its proxy.
+	killEach = 2 * time.Second
 )
 
 type Launcher struct {
@@ -206,11 +210,20 @@ func (l *Launcher) Down(ctx context.Context) error {
 // demo: the code that knows how a pair was built also takes it down. The
 // containers stay, stopped, so their logs can still be read.
 func (l *Launcher) Kill(ctx context.Context, sandboxID string) error {
-	// The sandbox first, so it is never running without its proxy.
+	// The sandbox first, so it is never running without its proxy. Both are
+	// tried whatever happens to the first, and one that already stopped is
+	// not an error: a sandbox that crashed must not leave its proxy running.
+	var errs []error
 	for _, name := range []string{"tsi-sandbox-" + sandboxID, "tsi-proxy-" + sandboxID} {
-		if _, err := l.cli.ContainerKill(ctx, name, client.ContainerKillOptions{Signal: "SIGKILL"}); err != nil {
-			return fmt.Errorf("kill %s: %w", name, err)
+		ctx, cancel := context.WithTimeout(ctx, killEach)
+		info, err := l.cli.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+		if err == nil && info.Container.State.Running {
+			_, err = l.cli.ContainerKill(ctx, name, client.ContainerKillOptions{Signal: "SIGKILL"})
+		}
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("kill %s: %w", name, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...) // nil when there were none
 }
