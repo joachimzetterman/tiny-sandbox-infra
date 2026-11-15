@@ -171,7 +171,7 @@ Bytes means everything the sandbox sends: the request line, the headers and the 
 
 **Two levels.** Every rule runs once per sandbox and can use that sandbox's numbers and its tenant's totals. A rule on a tenant number therefore acts on every sandbox of the tenant.
 
-**Baselines.** Each sandbox and each tenant has a slow moving average of its own offered rate (about a minute). A rule can ask whether something is behaving unlike itself. A baseline does not learn while a rule objects to the behaviour, or a flood that lasts long enough would become the new normal.
+**Baselines.** Each sandbox has a slow moving average of its own offered rate (about a minute). A tenant's baseline is the sum of its sandboxes' baselines, so a sandbox that starts or leaves moves the tenant's rate and its baseline together. A rule can ask whether something is behaving unlike itself. A baseline does not learn while a rule objects to anything in the tenant, or a flood that lasts long enough would become the new normal. A sandbox's first window is taken as its normal on the same condition. Until it has a baseline, its baseline is zero, so only the fixed part of a rule (`offered_rate > 100.0`) can speak for it.
 
 **Rules** live in YAML, see [`rules/a.yaml`](rules/a.yaml):
 
@@ -180,7 +180,7 @@ Bytes means everything the sandbox sends: the request line, the headers and the 
   expr: offered_rate > 100.0 && offered_rate > 6.0 * baseline_rate   # CEL
   for: 2s          # how long expr must hold
   action: throttle
-  rate: 10         # throttle only: the new events per second
+  rate: 10         # throttle only, and required there: the new events per second
   mode: enforce    # or shadow. Left out, a rule is shadow.
   ttl: 30s         # the action expires this long after the rule last fired
 ```
@@ -199,7 +199,7 @@ A typo in a rule is an error when the guard starts, not a rule that never fires.
 | `bad_site_attempts` | Calls to bad sites in the window (a count, not a rate). |
 | `baseline_rate` | This sandbox's own normal `offered_rate`. |
 | `tenant_offered_rate` | `offered_rate` summed over the tenant's sandboxes. |
-| `tenant_baseline_rate` | The tenant's own normal `tenant_offered_rate`. |
+| `tenant_baseline_rate` | `baseline_rate` summed over the tenant's sandboxes. |
 | `tenant_sandboxes` | How many of the tenant's sandboxes are reporting. |
 | `tier` | `"free"` or `"paid"`. |
 
@@ -217,18 +217,20 @@ Events and egress are separate controls. When several rules hold an action on on
 **Limits on the guard itself.**
 
 - *Tiers.* Automation never kills a paid tenant's sandbox. The kill becomes `block_egress` and an approval request is logged and written to the audit trail. A tenant the guard has no tier for is treated as paid.
-- *Blast radius cap.* At most `max_kills_per_minute` kills. Above that the guard stops killing, logs that a human is needed, and keeps the cheaper actions working. A refused kill is tried again once there is room.
+- *Blast radius cap.* At most `max_kills_per_minute` kills. Above that the guard stops killing, logs that a human is needed, and keeps the cheaper actions working. A refused kill becomes `block_egress`, like a paid tenant's, and is tried again once there is room.
 - *Shadow mode.* A shadow rule writes one audit row saying what it would have done.
 
-**Audit and usage.** Every decision, enforced or shadow, and every lifted action is a row in `guard_actions`, with the rule, the note and the rule variables at that moment. Every heartbeat is a row in `usage`. `make usage` shows cost per tenant from it.
+**Audit and usage.** Every decision, enforced or shadow, and every lifted action is a row in `guard_actions`, with the rule, the note and the rule variables at that moment. Every heartbeat is a row in `usage`, with the proxy's running totals and the time that proxy started. `make usage` shows cost per tenant from it: the largest value of each proxy run, added up, so a proxy that restarts and counts from zero again loses nothing.
+
+**Memory.** The guard tracks at most 10,000 sandboxes at once. One that has been silent for a minute, with no action held against it, is forgotten.
 
 **When things fail.**
 
 | Failure | What happens |
 |---|---|
 | Guard is down | Proxies keep their last policy and their static limits. Ingest keeps its last deny list. Nothing loosens. |
-| Guard restarts | It has no memory. Each proxy reports the policy it is enforcing and the guard keeps it for 30 seconds, by which time the rules have judged the sandbox again. |
-| A kill fails | The sandbox is already cut off by policy: no events, no egress, and on the deny list. |
+| Guard restarts | It has no memory. Each proxy reports the policy it is enforcing and the guard keeps it for 30 seconds. A sandbox that comes back under a policy gets no baseline from what it is doing now, so a flood that is still going trips its rule again within seconds. |
+| A kill fails | The sandbox is already cut off by policy: no events, no egress, and on the deny list. Both containers are tried even if one fails, and while the proxy still sends heartbeats the kill is tried again every 10 seconds. |
 | ClickHouse is down | The guard keeps deciding. Audit and usage rows wait in memory, up to a limit, and every decision is also a log line. |
 | A proxy dies | Its sandbox has no other link. See below. |
 
@@ -264,21 +266,26 @@ and for the guard:
 
 - window maths: rates from running totals, a late heartbeat, a counter that went down
 - a baseline follows slowly, and not at all while a rule objects
+- a tenant that starts four busy sandboxes at once is not taken for a split flood, and a new sandbox cannot dilute one that is under way
 - a rule fires only after `for`, stays while it fires, and is lifted one `ttl` later
-- a mistake in a rule file is refused when it is loaded
+- a mistake in a rule file is refused when it is loaded, including a throttle without a rate
 - the split flood is caught by the tenant's total, and the same sandbox alone is left in peace
 - a paid tenant's sandbox is never killed, and neither is one of an unknown tenant
-- the blast radius cap stops the third kill, keeps the throttle, and allows the kill a minute later
+- the blast radius cap stops the third kill, blocks egress in its place, keeps the throttle, and allows the kill a minute later
+- two kill rules that fire together kill a sandbox once and use one slot of the cap
+- a kill that fails is tried again while the proxy still reports
 - the deny list is the killed and the cut off, and ingest drops their events also when the guard is gone
 - a proxy keeps its last policy and its static limits when the guard is down
-- a restarted guard does not loosen what a proxy enforces
+- a restarted guard does not loosen what a proxy enforces, and does not take a flood in progress for normal
+- a sandbox that is gone is forgotten, so the limit of 10,000 counts the ones that are there
+- the timeline tells "contained" from "acted on before it misbehaved"
 - the shipped rule set against the shipped scenario: every bad sandbox contained, no good one touched
 
 `make test-integration` needs a Docker engine. It starts real pairs and proves:
 
 - a sandbox can reach its own proxy and nothing else: not ingest, the guard, ClickHouse, the fake internet, another sandbox's proxy, its own proxy's other interfaces, a public address or any DNS name. A control probe from a proxy's position reaches the same targets, so the failures are the network saying no. The test also checks that the sandbox is attached to exactly one network.
 - a sandbox whose proxy dies can reach nothing at all
-- a kill stops both containers of a pair
+- a kill stops both containers of a pair, also when the sandbox had already exited, and killing twice is not an error
 
 ## Measured footprint
 
@@ -294,8 +301,9 @@ These are relative numbers from one laptop, not capacity claims. x86 has not bee
 - **The Docker socket is a local shortcut.** `launch` and `guard` mount it, which is root on the host. In production both would call a scheduler API with a narrow, audited permission, and the guard's would allow one thing: stop this sandbox.
 - **Numbers are relative comparisons on a laptop**, not capacity claims.
 - **No authentication between components** (a stated non-goal). Ingest and the guard believe any caller on the control network. In production each proxy would have an identity, and both would check that a batch or a heartbeat names the sandbox that identity belongs to.
-- **The guard's memory is one process.** It is rebuilt from heartbeats after a restart, with two gaps: baselines start again, and a kill that failed is forgotten. It also assumes a sandbox ID is never reused, which is why `make demo` starts each run with a fresh guard.
-- **A sandbox that misbehaves from its first second has no baseline to differ from.** Rules that compare with the baseline miss it. Fixed limits, like the proxy's token bucket, still apply.
+- **The guard's memory is one process.** It is rebuilt from heartbeats after a restart, with three gaps: baselines start again, a kill that failed is forgotten, and an action taken over from a proxy lasts 30 seconds whatever its `ttl` was (a blocked upload then gets its next chance early). It also assumes a sandbox ID is not reused while the guard still remembers it, which is why `make demo` starts each run with a fresh guard.
+- **A sandbox that misbehaves from its first second has no baseline to differ from.** Rules that compare with the baseline miss it, and it raises its tenant's baseline with it. Fixed limits, like the proxy's token bucket, still apply.
+- **A baseline that starts wrong can stay wrong.** The first two seconds of a sandbox are taken as its normal. One that starts slowly and then settles above a rule's threshold is flagged, and a firing rule stops the baseline learning, so the false positive lasts until a human looks. The same holds for any wrong rule.
 - **Blocking egress stops new calls.** A call already in flight finishes, within the 30 seconds a call may take, or the 60 seconds a tunnel may live.
 - **An action hides the evidence for it.** Once egress is blocked no bytes leave, so the rule goes quiet and the block ends one `ttl` later. The `ttl` is how long a sandbox waits for its next chance, so it is long for `block_egress`.
 - **The deny list was never needed in the demo.** A proxy that is cut off accepts nothing, and a killed proxy forwards nothing. It is there for a proxy that misbehaves, and is covered by a unit test.
