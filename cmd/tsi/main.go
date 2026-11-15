@@ -17,6 +17,7 @@ import (
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/chstore"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/clock"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/fakenet"
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/guard"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/ingest"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/launch"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/proxy"
@@ -24,7 +25,7 @@ import (
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/scenario"
 )
 
-const usage = "usage: tsi sandbox | proxy | ingest | fakenet | launch up | launch down"
+const usage = "usage: tsi sandbox | proxy | ingest | guard | fakenet | launch up | launch down"
 
 func main() {
 	// Every log line carries the IDs this process was started with.
@@ -63,30 +64,51 @@ func run(ctx context.Context, args []string) error {
 		return proxy.New(proxy.Config{
 			TenantID: env("TSI_TENANT_ID", ""), SandboxID: env("TSI_SANDBOX_ID", ""),
 			ListenIP: env("TSI_LISTEN_IP", ""), PeerIP: env("TSI_PEER_IP", ""),
-			IngestURL: env("TSI_INGEST_URL", "http://ingest:8080"),
-			Rate:      float64(number("TSI_RATE", 100)), Burst: number("TSI_BURST", 200),
+			IngestURL: env("TSI_INGEST_URL", "http://ingest:8080"), GuardURL: env("TSI_GUARD_URL", ""),
+			Rate: float64(number("TSI_RATE", 100)), Burst: number("TSI_BURST", 200),
 			Sites: scenario.Sites{Trusted: list("TSI_SITES_TRUSTED"), Watched: list("TSI_SITES_WATCHED"), Bad: list("TSI_SITES_BAD")},
 			Clock: c,
 		}).Run(ctx)
 	case "ingest":
-		store, err := chstore.Open(env("TSI_CLICKHOUSE_ADDR", "clickhouse:9000"), env("TSI_CLICKHOUSE_DB", "tsi"),
-			env("TSI_CLICKHOUSE_USER", "tsi"), env("TSI_CLICKHOUSE_PASSWORD", ""), c)
+		store, err := openStore(c)
 		if err != nil {
 			return err
 		}
 		return ingest.New(ingest.Config{
-			Addr: env("TSI_ADDR", ":8080"), Sink: store,
+			Addr: env("TSI_ADDR", ":8080"), Sink: store, GuardURL: env("TSI_GUARD_URL", ""),
 			QueueLimit: number("TSI_QUEUE_LIMIT", 50000), QueueBytes: number("TSI_QUEUE_BYTES", 64<<20),
 			FlushRows:  number("TSI_FLUSH_ROWS", 10000),
 			FlushEvery: duration("TSI_FLUSH_EVERY", time.Second),
 		}).Run(ctx)
+	case "guard":
+		sc, err := scenario.Load(env("TSI_SCENARIO", "scenarios/default.yaml"))
+		if err != nil {
+			return err
+		}
+		rules, err := guard.LoadRules(env("TSI_RULES", "rules/a.yaml"))
+		if err != nil {
+			return err
+		}
+		store, err := openStore(c)
+		if err != nil {
+			return err
+		}
+		// The guard kills through the same Docker code that launch builds with.
+		docker, err := launch.New("", "", "")
+		if err != nil {
+			return err
+		}
+		return guard.New(guard.Config{
+			Addr: env("TSI_ADDR", ":8080"), Rules: rules, Tiers: sc.Tiers(), Runtime: docker, Sink: store, Clock: c,
+		}).Run(ctx)
 	case "fakenet":
 		return fakenet.Run(ctx, env("TSI_ADDR", ":80"))
 	case "launch":
-		// Starting 17 pairs takes a few seconds. Two minutes means something is stuck.
-		ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		// Starting 17 pairs takes a few seconds and the timeline about a
+		// minute. Five minutes means something is stuck.
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
-		l, err := launch.New(env("TSI_IMAGE", "tsi:dev"), env("TSI_INGEST_URL", "http://ingest:8080"))
+		l, err := launch.New(env("TSI_IMAGE", "tsi:dev"), env("TSI_INGEST_URL", "http://ingest:8080"), env("TSI_GUARD_URL", "http://guard:8080"))
 		if err != nil {
 			return err
 		}
@@ -97,9 +119,17 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return l.Up(ctx, sc)
+		if err := l.Up(ctx, sc); err != nil {
+			return err
+		}
+		return l.Watch(ctx, sc, duration("TSI_WATCH", 70*time.Second), os.Stdout)
 	}
 	return fmt.Errorf("unknown role %q\n%s", args[0], usage)
+}
+
+func openStore(c clock.Clock) (*chstore.Store, error) {
+	return chstore.Open(env("TSI_CLICKHOUSE_ADDR", "clickhouse:9000"), env("TSI_CLICKHOUSE_DB", "tsi"),
+		env("TSI_CLICKHOUSE_USER", "tsi"), env("TSI_CLICKHOUSE_PASSWORD", ""), c)
 }
 
 func env(key, fallback string) string {

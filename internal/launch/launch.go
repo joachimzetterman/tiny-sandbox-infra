@@ -10,11 +10,13 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/clock"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/scenario"
 )
 
@@ -30,14 +32,18 @@ type Launcher struct {
 	cli       *client.Client
 	Image     string
 	IngestURL string
+	GuardURL  string
+	Clock     clock.Clock
+	began     time.Time            // when Up started, the zero of the timeline
+	started   map[string]time.Time // sandbox ID to when its container started
 }
 
-func New(image, ingestURL string) (*Launcher, error) {
+func New(image, ingestURL, guardURL string) (*Launcher, error) {
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, err
 	}
-	return &Launcher{cli: cli, Image: image, IngestURL: ingestURL}, nil
+	return &Launcher{cli: cli, Image: image, IngestURL: ingestURL, GuardURL: guardURL, Clock: clock.Real{}, started: map[string]time.Time{}}, nil
 }
 
 // Pair is the private network of one sandbox and the two addresses on it.
@@ -67,6 +73,7 @@ func (l *Launcher) Up(ctx context.Context, sc *scenario.Scenario) error {
 		return err
 	}
 	base := netip.MustParsePrefix(sc.Subnet) // validated when the scenario was loaded
+	l.began = l.Clock.Now()
 	index := 0
 	for _, t := range sc.Tenants {
 		for _, s := range t.Sandboxes {
@@ -85,7 +92,9 @@ func (l *Launcher) Up(ctx context.Context, sc *scenario.Scenario) error {
 			if _, err := l.startSandbox(ctx, s.ID, pair, env); err != nil {
 				return fmt.Errorf("sandbox %s: %w", s.ID, err)
 			}
-			slog.Info("started pair", "tenant_id", t.ID, "sandbox_id", s.ID, "behaviour", s.Behaviour, "subnet", pair.Subnet.String())
+			// Start offsets in the scenario count from this moment.
+			l.started[s.ID] = l.Clock.Now()
+			slog.Debug("started pair", "tenant_id", t.ID, "sandbox_id", s.ID, "behaviour", s.Behaviour, "subnet", pair.Subnet.String())
 		}
 	}
 	return nil
@@ -113,7 +122,7 @@ func (l *Launcher) startProxy(ctx context.Context, sc *scenario.Scenario, tenant
 	env := []string{
 		"TSI_TENANT_ID=" + tenantID, "TSI_SANDBOX_ID=" + sandboxID,
 		"TSI_LISTEN_IP=" + pair.ProxyIP.String(), "TSI_PEER_IP=" + pair.SandboxIP.String(),
-		"TSI_INGEST_URL=" + l.IngestURL,
+		"TSI_INGEST_URL=" + l.IngestURL, "TSI_GUARD_URL=" + l.GuardURL,
 		"TSI_RATE=" + strconv.Itoa(sc.Limits.EventsPerSec), "TSI_BURST=" + strconv.Itoa(sc.Limits.Burst),
 		"TSI_SITES_TRUSTED=" + strings.Join(sc.Sites.Trusted, ","),
 		"TSI_SITES_WATCHED=" + strings.Join(sc.Sites.Watched, ","),
@@ -149,8 +158,11 @@ func (l *Launcher) start(ctx context.Context, name, role, sandboxID string, env 
 			Labels: map[string]string{labelManaged: "1", "tsi.role": role, "tsi.sandbox_id": sandboxID},
 		},
 		HostConfig: &container.HostConfig{
-			// Without an explicit mode Docker also attaches the default
-			// bridge, which has a route to the outside world.
+			// Spelled out, not left to the default, which is Docker's own
+			// bridge with a route to the outside world. Engine 29 was seen
+			// to attach only the networks listed below even without this
+			// line, but isolation should not rest on how one engine version
+			// reads an empty field. The integration test checks the result.
 			NetworkMode:    container.NetworkMode(primaryNet),
 			CapDrop:        []string{"ALL"},
 			ReadonlyRootfs: true,
@@ -185,6 +197,19 @@ func (l *Launcher) Down(ctx context.Context) error {
 	for _, n := range networks.Items {
 		if _, err := l.cli.NetworkRemove(ctx, n.ID, client.NetworkRemoveOptions{}); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// Kill stops one sandbox and its proxy. It is the guard's Runtime in the
+// demo: the code that knows how a pair was built also takes it down. The
+// containers stay, stopped, so their logs can still be read.
+func (l *Launcher) Kill(ctx context.Context, sandboxID string) error {
+	// The sandbox first, so it is never running without its proxy.
+	for _, name := range []string{"tsi-sandbox-" + sandboxID, "tsi-proxy-" + sandboxID} {
+		if _, err := l.cli.ContainerKill(ctx, name, client.ContainerKillOptions{Signal: "SIGKILL"}); err != nil {
+			return fmt.Errorf("kill %s: %w", name, err)
 		}
 	}
 	return nil
