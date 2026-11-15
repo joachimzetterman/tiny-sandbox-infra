@@ -1,0 +1,13 @@
+version: "2"
+linters:
+  settings:
+    errcheck:
+      # An error from Close or from writing a reply means the other side
+      # hung up. There is nothing useful to do with it.
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+        - (*os.File).Close
+        - (github.com/ClickHouse/clickhouse-go/v2/lib/driver.Batch).Close
+        - fmt.Fprintf
+        - fmt.Fprintln
