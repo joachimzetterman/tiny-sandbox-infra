@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: go vet -tags integration ./...
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+          args: --build-tags integration
+      - name: unit tests
+        run: make test
+      # Needs the Docker engine on the runner (28.0 or newer for the
+      # isolated gateway mode).
+      - name: integration tests
+        run: make test-integration
+      - name: logs on failure
+        if: failure()
+        run: docker compose logs --tail 100

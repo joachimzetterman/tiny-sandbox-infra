@@ -1,0 +1,47 @@
+# The default demo: 17 sandboxes across 15 tenants.
+# Every sandbox behaves normally until its start offset.
+
+# Carved into one /29 per sandbox. Change it if it collides with a network
+# you already use.
+subnet: 10.77.0.0/16
+
+# Static limits every proxy starts with.
+limits:
+  events_per_sec: 100
+  burst: 200
+
+# Site classes. A domain in no class is denied.
+sites:
+  trusted: [allowed.test]  # allowed
+  watched: [paste.test]    # allowed, bytes counted separately
+  bad: [evil.test]         # blocked, every attempt counted
+
+tenants:
+  # Nine quiet neighbours. They must never be touched.
+  - {id: t01, tier: free, sandboxes: [{id: s01, behaviour: normal}]}
+  - {id: t02, tier: free, sandboxes: [{id: s02, behaviour: normal}]}
+  - {id: t03, tier: free, sandboxes: [{id: s03, behaviour: normal}]}
+  - {id: t04, tier: free, sandboxes: [{id: s04, behaviour: normal}]}
+  - {id: t05, tier: free, sandboxes: [{id: s05, behaviour: normal}]}
+  - {id: t06, tier: free, sandboxes: [{id: s06, behaviour: normal}]}
+  - {id: t07, tier: free, sandboxes: [{id: s07, behaviour: normal}]}
+  - {id: t08, tier: free, sandboxes: [{id: s08, behaviour: normal}]}
+  - {id: t09, tier: free, sandboxes: [{id: s09, behaviour: normal}]}
+
+  # Legitimate spikes from a paying tenant. Must never be touched either.
+  - {id: t10, tier: paid, sandboxes: [{id: s10, behaviour: bursty}]}
+
+  # The misbehaving ones.
+  - {id: t11, tier: free, sandboxes: [{id: s11, behaviour: flood, start: 10s}]}
+  - {id: t12, tier: free, sandboxes: [{id: s12, behaviour: exfil, start: 20s}]}
+  - {id: t13, tier: free, sandboxes: [{id: s13, behaviour: baddest, start: 30s}]}
+  - {id: t14, tier: paid, sandboxes: [{id: s14, behaviour: baddest, start: 35s}]}
+
+  # A split flood: each sandbox stays just under the per-sandbox limit, so
+  # only a tenant-level view can see it.
+  - id: t15
+    tier: free
+    sandboxes:
+      - {id: s15, behaviour: flood, start: 40s, rate: 90}
+      - {id: s16, behaviour: flood, start: 40s, rate: 90}
+      - {id: s17, behaviour: flood, start: 40s, rate: 90}

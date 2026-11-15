@@ -1,0 +1,74 @@
+# The fixed parts of the demo. Sandbox and proxy pairs are not listed here:
+# `tsi launch` creates them through the Docker API, one network per pair.
+name: tsi
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    environment:
+      CLICKHOUSE_DB: tsi
+      CLICKHOUSE_USER: tsi
+      CLICKHOUSE_PASSWORD: tsi-local-only  # local demo credential, not a secret
+    volumes:
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/tsi.xml:ro
+      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - ./clickhouse/usage.sql:/usage.sql:ro
+    mem_limit: 1500m
+    ulimits:
+      nofile: 262144
+    networks: [storage]
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "tsi", "--password", "tsi-local-only", "-q", "SELECT 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ingest:
+    build: .
+    image: tsi:dev
+    command: [ingest]
+    environment:
+      TSI_CLICKHOUSE_PASSWORD: tsi-local-only
+      # The queue is bounded at 64 MiB. This tells the Go runtime to collect
+      # garbage harder before the container limit is reached.
+      GOMEMLIMIT: 200MiB
+    mem_limit: 256m
+    networks: [control, storage]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  fakenet:
+    image: tsi:dev
+    command: [fakenet]
+    mem_limit: 64m
+    networks:
+      internet:
+        aliases: [allowed.test, paste.test, evil.test]
+    depends_on: [ingest]  # only so the image is built first
+
+  # One-shot: `docker compose run --rm launch up`. This is the only service
+  # with the Docker socket. Mounting it is a local shortcut, see the README.
+  launch:
+    image: tsi:dev
+    profiles: [tools]
+    command: [launch, up]
+    user: "0:0"
+    environment:
+      TSI_SCENARIO: /scenarios/default.yaml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scenarios:/scenarios:ro
+    networks: [control]
+
+# All three are internal: nothing in the demo has a route to the real internet.
+networks:
+  control:
+    name: tsi-control
+    internal: true
+  internet:
+    name: tsi-internet
+    internal: true
+  storage:
+    name: tsi-storage
+    internal: true
