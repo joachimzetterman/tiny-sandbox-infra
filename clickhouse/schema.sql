@@ -24,3 +24,48 @@ ENGINE = MergeTree
 PARTITION BY toDate(event_time)
 ORDER BY (tenant_id, sandbox_id, event_time)
 TTL toDateTime(event_time) + INTERVAL 7 DAY;
+
+-- The audit trail: one row for every decision the guard makes, enforced or
+-- shadow, and one when an action is lifted. inputs holds the rule variables
+-- at that moment, so "why" can be answered later without the guard.
+CREATE TABLE IF NOT EXISTS tsi.guard_actions
+(
+    at         DateTime64(3, 'UTC'),
+    tenant_id  String,
+    sandbox_id String,
+    tier       LowCardinality(String),
+    rule       LowCardinality(String),
+    mode       LowCardinality(String),  -- shadow or enforce
+    action     LowCardinality(String),  -- what the rule asked for
+    effect     LowCardinality(String),  -- what was done, empty for nothing
+    note       LowCardinality(String),  -- why the two differ: shadow, approval_requested, blast_radius_cap, lifted, adopted
+    rate       Float64,                 -- throttle only
+    inputs     Map(LowCardinality(String), Float64),
+    expires    DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toDate(at)
+ORDER BY (tenant_id, sandbox_id, at)
+TTL toDateTime(at) + INTERVAL 30 DAY;
+
+-- One row per sandbox per second, written by the guard from the heartbeats
+-- it already receives. The values are the proxy's running totals, not the
+-- growth since the last row. A guard that was down for a minute then loses
+-- nothing: the next row carries the totals, and only the shape of that
+-- minute is gone. Usage for a period is max minus min.
+CREATE TABLE IF NOT EXISTS tsi.usage
+(
+    tenant_id       String,
+    sandbox_id      String,
+    at              DateTime('UTC'),
+    events_accepted UInt64,
+    bytes_accepted  UInt64,
+    events_rejected UInt64,
+    egress_bytes    UInt64,
+    watched_bytes   UInt64,
+    blocked_calls   UInt64
+)
+ENGINE = MergeTree
+PARTITION BY toDate(at)
+ORDER BY (tenant_id, sandbox_id, at)
+TTL at + INTERVAL 7 DAY;
