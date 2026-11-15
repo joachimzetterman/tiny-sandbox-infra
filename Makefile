@@ -2,7 +2,7 @@
 # the engine from the host need its socket spelled out.
 export DOCKER_HOST ?= $(shell docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
 
-.PHONY: up down demo record usage actions test test-integration lint
+.PHONY: up down demo record ab usage actions test test-integration lint
 
 NAME ?= default
 
@@ -32,6 +32,9 @@ record: ## record scenarios/NAME.yaml into recordings/NAME.ndjson: make record N
 	TSI_SHADOW=1 TSI_RECORD=/recordings/$(NAME).ndjson TSI_SCENARIO=/scenarios/$(NAME).yaml $(MAKE) demo
 	@docker compose run --rm launch launch down
 	@$(MAKE) --no-print-directory up
+
+ab: ## replay the committed recordings through rule sets A and B. No Docker needed.
+	@for r in recordings/*.ndjson; do go run ./cmd/tsi ab --recording $$r --a rules/a.yaml --b rules/b.yaml || exit 1; done
 
 actions: ## the audit trail: every decision the guard made
 	@$(QUERY) /actions.sql

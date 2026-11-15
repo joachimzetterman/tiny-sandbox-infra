@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,11 +24,12 @@ import (
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/ingest"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/launch"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/proxy"
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/replay"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/sandbox"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/scenario"
 )
 
-const usage = "usage: tsi sandbox | proxy | ingest | guard | fakenet | launch up | launch down"
+const usage = "usage: tsi sandbox | proxy | ingest | guard | fakenet | launch up | launch down | ab --recording R --a RULES --b RULES"
 
 func main() {
 	// Every log line carries the IDs this process was started with.
@@ -123,6 +125,19 @@ func run(ctx context.Context, args []string) error {
 		return guard.New(guard.Config{
 			Addr: env("TSI_ADDR", ":8080"), Rules: rules, Tiers: sc.Tiers(), Runtime: docker, Sink: store, Record: record, Clock: c,
 		}).Run(ctx)
+	case "ab":
+		// The one role with flags: it is run by hand, not in a container.
+		flags := flag.NewFlagSet("ab", flag.ContinueOnError)
+		recording := flags.String("recording", "", "the recording to replay")
+		a, b := flags.String("a", "rules/a.yaml", "rule set A"), flags.String("b", "rules/b.yaml", "rule set B")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		// A replayed guard logs every decision. The report is the output.
+		log := slog.Default()
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+		defer slog.SetDefault(log)
+		return replay.AB(os.Stdout, *recording, *a, *b)
 	case "fakenet":
 		return fakenet.Run(ctx, env("TSI_ADDR", ":80"))
 	case "launch":
