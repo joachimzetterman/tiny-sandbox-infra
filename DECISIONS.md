@@ -30,3 +30,40 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 
 - **YAML:** `go.yaml.in/yaml/v3`. Rejected `gopkg.in/yaml.v3` (last release 2022, unmaintained) and v4 of the maintained fork (days old when this was written). cel-go already depends on v3 of the fork, so it adds no module.
 - **Docker client:** `github.com/moby/moby/client`. Rejected `github.com/docker/docker`, the old import path, which stopped receiving releases at v28.
+
+## 6. At-least-once delivery, by peeking the buffer
+
+- **Chose:** the proxy and ingest each hold a bounded queue. A batch is read with Peek, sent, and removed with Drop only after the next hop accepted it. A failed send is retried with the same events.
+- **Rejected:** (a) dropping a batch when the send fails: simple, but a short ingest outage silently loses accepted data. (b) a durable queue between proxy and ingest: the right answer at real scale and a non-goal here.
+- **Why:** once the gateway answered 200 the event is ours to keep. The cost is duplicates: if ingest stores a batch and the reply is lost, the proxy sends it again. `event_id` is assigned once at the gateway, so duplicates share an ID and can be removed at read time. The demo does not deduplicate.
+
+## 7. A batch that does not fit the token bucket is refused whole
+
+- **Chose:** if the valid events in a request need more tokens than the bucket has, the whole request gets a 429 with `Retry-After`.
+- **Rejected:** accepting as many events as there are tokens and refusing the rest.
+- **Why:** a producer that gets "all or nothing" has one simple rule: wait, then resend the same request. Partial acceptance needs per-event bookkeeping on both sides. A batch larger than the bucket could never succeed, so it gets `batch_too_large` and not `rate_limited`, which would invite a pointless retry.
+
+## 8. Compose runs the fixed parts, launch runs the pairs
+
+- **Chose:** ClickHouse, ingest and the fake internet are Compose services. Sandbox and proxy pairs are created by `tsi launch` through the Docker API.
+- **Rejected:** (a) everything in Compose: 17 near-identical pairs and 17 networks written out by hand, and no way to drive them from a scenario file. (b) everything through the Docker API: more code for no gain, Compose already does health checks and ordering.
+- **Why:** the pairs are the part that varies per scenario and the part where the network layout is the design. Keeping them in code puts that layout in one function that can be read and tested.
+
+## 9. ClickHouse table layout
+
+- **Chose:** one shared `events` table, `ORDER BY (tenant_id, sandbox_id, event_time)`, partitioned by day, `tenant_id` as a plain `String`, written with explicit client-side batches.
+- **Rejected:** (a) `LowCardinality(String)` for `tenant_id`: built for a few thousand distinct values, and many tiny tenants is the opposite. (b) server-side `async_insert`: it batches for you, but then backpressure is ClickHouse's decision and not ours. We want a full buffer to turn into a 429 at the gateway.
+- **Why:** daily partitions are only safe because the proxy clamps `event_time`. That dependency is the reason the clamp exists, and it is written next to both.
+
+## 10. The demo's fake hosts speak plain HTTP
+
+- **Chose:** the fake internet serves HTTP only. The proxy supports HTTPS tunnels (CONNECT) and a unit test exercises one against a local TLS server.
+- **Rejected:** generating a throwaway certificate in `fakenet` and having the simulated sandbox skip verification.
+- **Why:** about 40 lines that would show nothing new. For a tunnel the proxy can only see the host name and count bytes, and both are covered by the test. The limit is stated in the README: the live demo never opens a tunnel.
+
+## 11. Small choices
+
+- **Settings by environment variable**, not flags or config files: it is what a container gets most easily, and a missing or unparsable limit falls back to the default limit, never to no limit.
+- **UUIDv7 written by hand** (about 10 lines), not a dependency: the standard library has no UUID type and the layout is fixed by RFC 9562.
+- **The proxy checks the caller's address** although the network already guarantees it: one `if`, and it turns a future mistake in the network layout into a refusal and not a leak.
+- **Start offsets count from each sandbox's own start**, not a shared clock: no coordination needed, and launch knows when it started each one.
