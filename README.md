@@ -4,7 +4,7 @@ A local, reproducible demo of control-plane infrastructure for running untrusted
 
 Design notes: _link to come_
 
-**Status: stage 2 of 3.** The trust boundary, the data path and the guard are built and tested. The recorder and the A/B replay (stage 3) are not built yet. Everything described below exists and runs; anything that does not is marked as planned.
+**Status: all three stages are built.** The trust boundary and the data path, the guard, and the recorder with the A/B replay. Everything described below exists and runs.
 
 ## Quickstart
 
@@ -16,6 +16,8 @@ make demo    # start 17 sandboxes across 15 tenants and watch the guard for 70 s
 ```
 
 `make down` removes everything, including the networks.
+
+`make ab` needs only Go, no Docker: it replays the committed recordings through two rule sets and prints the report shown below.
 
 ## What the demo shows
 
@@ -98,7 +100,47 @@ And cost per tenant, from the usage table (`make usage`, rows trimmed):
 
 The exfil moved 3 MiB before it was blocked. Without the guard the same sandbox moved 40 MiB in a minute and never stopped. Every sandbox claims to be tenant `someone-else` in every event. No such tenant appears.
 
-The A/B report (stage 3) will be pasted here when it exists.
+## What the A/B replay shows
+
+A rule that is wrong in production throttles paying tenants or misses an attack. So before a rule set is allowed to enforce, it is run against recorded traffic. `make ab` replays the same recording of the demo through two rule sets:
+
+- [`rules/a.yaml`](rules/a.yaml), the one the demo runs: thresholds relative to each sandbox's own baseline, a tenant-level limit, and a `for` of two seconds before it acts.
+- [`rules/b.yaml`](rules/b.yaml): fixed limits on each sandbox by itself, acting on the first window that crosses a line.
+
+The end of the report (`make ab`, the full report has one table per rule set as well):
+
+```
+## A against B
+
+| | A | B |
+|---|---|---|
+| s11 flood contained after | 3.0 s | 1.0 s |
+| s12 exfil contained after | 3.0 s | 1.0 s |
+| s13 baddest contained after | 3.0 s | 1.0 s |
+| s14 baddest contained after | 3.0 s | 1.0 s |
+| s15 flood contained after | 5.0 s | **never** |
+| s16 flood contained after | 5.0 s | **never** |
+| s17 flood contained after | 5.0 s | **never** |
+| Bad sandboxes contained | 7 of 7 | 4 of 7 |
+| Misses | 0 | 3 |
+| False positives | 0 | 1 |
+| Events passed after onset | 4302 | 7362 |
+| Egress before the block | 3077 KiB | 1028 KiB |
+| Blast radius cap | not reached | not reached |
+```
+
+and from B's own section:
+
+```
+- Misses: **3**: s15 (flood), s16 (flood), s17 (flood)
+- False positives: **1**: s10 (bursty, paid) throttle by `flood` at 22.9 s
+```
+
+**B is faster, and it is wrong twice.** It contains the single flood in one second where A takes three, and it lets a third of the exfil through. It also throttles `s10`, a paying tenant's legitimate burst, and it never sees the split flood, because no sandbox of that tenant crosses a line by itself. Which of the two to run is a judgement. The replay is what turns it from a guess into a table.
+
+The times are whole seconds because a replay knows when a behaviour began only from the start time of the sandbox's proxy, and heartbeats tick from that same moment. The live demo, where the launcher knows the real onset, measured 2.9 s for the same thing.
+
+A second recording, `recordings/mass.ndjson`, is a mass event: five free sandboxes call a bad site at once. Both rule sets answer with a kill, the blast radius cap allows three a minute, and the report says so: `Blast radius cap: **reached**, 2 kills refused`. The two that were refused have their egress blocked.
 
 ## Architecture
 
@@ -117,6 +159,9 @@ flowchart LR
     G -->|kill| D[Docker API]
     L[launch] -->|creates pairs| D
     L -->|reads decisions for the timeline| G
+    G -.->|every heartbeat, when recording| R[(recording<br/>NDJSON)]
+    R -.-> AB[ab<br/>the same guard code,<br/>recorded time, no Docker]
+    AB -.-> M[Markdown report]
 ```
 
 Everything is one binary, `tsi`, with one role per subcommand.
@@ -129,7 +174,7 @@ Everything is one binary, `tsi`, with one role per subcommand.
 | `guard` | Turns heartbeats into rates, evaluates the rules and applies the ladder. Writes the audit trail and the usage table. |
 | `launch` | Reads a scenario file and creates the pairs and their networks through the Docker API. Then prints the timeline. |
 | `fakenet` | The pretend internet: one server that answers for every host name. |
-| `ab` | Planned for stage 3. |
+| `ab` | Replays a recording through two rule sets and prints a Markdown report. Needs no Docker and no ClickHouse. |
 
 ### What the proxy enforces
 
@@ -234,6 +279,29 @@ Events and egress are separate controls. When several rules hold an action on on
 | ClickHouse is down | The guard keeps deciding. Audit and usage rows wait in memory, up to a limit, and every decision is also a log line. |
 | A proxy dies | Its sandbox has no other link. See below. |
 
+### Recorder and replay
+
+**Recording.** With `TSI_RECORD` set, the guard appends every heartbeat it receives to a file, one JSON value per line, with the time it arrived. The first line is the scenario: the ground truth of who misbehaves, how, and from what offset. A recording is bounded at 64 MiB.
+
+**Shadow while recording.** `make record` runs the demo with every rule forced to shadow (`TSI_SHADOW`). If rules enforced while recording, a killed sandbox would stop sending and a throttled one would look different, so the traffic would already carry the mark of one rule set and the comparison would favour it. A recording made with rules enforcing says so in its header, and the report warns about it.
+
+**Replay.** `tsi ab --recording R --a rules/a.yaml --b rules/b.yaml` feeds the recorded heartbeats to the same guard code that runs live, once per rule set, with the clock set to each heartbeat's recorded time and a runtime that kills nothing. Expired actions are lifted at every whole second of recorded time. Nothing in it depends on the real time or on map order, so the same recording always gives the same report.
+
+**What the report measures**, per rule set and for each misbehaving sandbox, counted from the moment its behaviour began:
+
+| Column | Meaning |
+|---|---|
+| First action | The first decision of any kind, `observe` included. |
+| Contained | The first decision that throttles, blocks egress or kills. |
+| Events passed after onset | The events the recorded proxy accepted, cut down to what the replayed policy would have let through in each second. |
+| Egress before the block | The bytes that left while the replayed policy had egress open. |
+
+plus the misses (never contained), the false positives (a sandbox restricted while it was well behaved) and whether the blast radius cap was reached.
+
+**Replay is open loop.** The recorded traffic does not react to what a rule set decides. A sandbox that a rule set kills keeps sending in the recording. A sandbox that backs off when throttled does not back off here. So the times to first action and to containment are exact for the recorded traffic, and the two volume columns are estimates.
+
+`make record NAME=default` makes a new recording from `scenarios/NAME.yaml`. It needs Docker.
+
 ### Network layout
 
 The isolation of a sandbox is decided by how its network is built, not by code that could have a bug.
@@ -281,6 +349,16 @@ and for the guard:
 - the timeline tells "contained" from "acted on before it misbehaved"
 - the shipped rule set against the shipped scenario: every bad sandbox contained, no good one touched
 
+and for the recorder and the replay:
+
+- every heartbeat is recorded as it arrived, and a recording that fails or reaches its size limit stops without stopping the guard
+- replay is deterministic: the same recording gives the same report, byte for byte
+- a live guard that enforces and records, then its recording replayed through the same rules, reach the very same decisions
+- the shipped rule sets on the committed recording: A contains all seven and touches nobody else, B is faster on four, throttles the bursty sandbox and misses the split flood
+- the mass recording reaches the blast radius cap: three kills, two refused
+- events passed and egress before the block, checked on a hand-made recording with round numbers
+- a broken recording is refused
+
 `make test-integration` needs a Docker engine. It starts real pairs and proves:
 
 - a sandbox can reach its own proxy and nothing else: not ingest, the guard, ClickHouse, the fake internet, another sandbox's proxy, its own proxy's other interfaces, a public address or any DNS name. A control probe from a proxy's position reaches the same targets, so the failures are the network saying no. The test also checks that the sandbox is attached to exactly one network.
@@ -311,7 +389,9 @@ These are relative numbers from one laptop, not capacity claims. x86 has not bee
 - **Buffers are in memory.** A normal stop writes them out first. A crash or a kill loses what a proxy or ingest was still holding, including events already answered with a 200.
 - **The live demo never opens an HTTPS tunnel.** The fake hosts speak plain HTTP. CONNECT is covered by a unit test.
 - **The egress proxy sees host names and byte counts only.** It does not inspect content, and for a tunnel it trusts the host name in the CONNECT line.
-- **Replay is open loop** (stage 3): it cannot model how an action would have changed later traffic.
+- **Replay is open loop.** It cannot model how an action would have changed later traffic. Times to containment are exact for the recorded traffic, volumes are estimates.
+- **A replay knows the onset of a behaviour to within a few tenths of a second.** It uses the start time of the sandbox's proxy, which starts just before the sandbox. Both rule sets get the same error.
+- **Recordings are plain text**, about 400 KiB for a minute of 17 sandboxes. Fine for two committed files. A real recorder would sample or compress.
 
 ## What changes at real scale
 
@@ -335,14 +415,16 @@ internal/event/      event schema, checks, reason codes, bounded queue
 internal/control/    what proxy, ingest and guard say to each other: heartbeat, policy, deny list
 internal/proxy/      event gateway, token bucket, egress proxy, heartbeat
 internal/ingest/     batching writer, deny list
-internal/guard/      windows and baselines, rules, the ladder, audit
+internal/guard/      windows and baselines, rules, the ladder, audit, the recorder
+internal/replay/     a recording through a rule set, and the A/B report
 internal/chstore/    the only code that talks to ClickHouse
 internal/launch/     pairs and networks through the Docker API, kill, the timeline
 internal/scenario/   the scenario file
 internal/sandbox/    the simulated untrusted code
 clickhouse/          schema, memory cap, the usage and audit queries
-scenarios/           default.yaml: the 17-sandbox demo
-rules/               a.yaml: the rule set the demo runs
+scenarios/           default.yaml: the 17-sandbox demo. mass.yaml: five kills at once
+rules/               a.yaml: the rule set the demo runs. b.yaml: the one it is compared with
+recordings/          one recorded run of each scenario, for `make ab`
 docs/                the original brief (SPEC.md) and the plan
 DECISIONS.md         every real tradeoff: chosen, rejected, why
 ```
@@ -354,6 +436,8 @@ DECISIONS.md         every real tradeoff: chosen, rejected, why
 | `make up` | Build the image, start ClickHouse, ingest, the guard and the fake internet |
 | `make demo` | `up`, start the pairs, print the timeline, then the audit trail and cost per tenant |
 | `make down` | Remove the pairs, their networks and everything else |
+| `make ab` | Replay the committed recordings through rule sets A and B and print the report. No Docker needed. |
+| `make record NAME=default` | Record `scenarios/NAME.yaml` into `recordings/NAME.ndjson`, with every rule in shadow |
 | `make actions` | The audit trail: every decision the guard made |
 | `make usage` | Cost per tenant, from the usage table |
 | `make test` | Unit tests, no Docker needed |
