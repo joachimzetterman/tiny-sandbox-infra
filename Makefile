@@ -2,7 +2,9 @@
 # the engine from the host need its socket spelled out.
 export DOCKER_HOST ?= $(shell docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
 
-.PHONY: up down demo usage actions test test-integration lint
+.PHONY: up down demo record usage actions test test-integration lint
+
+NAME ?= default
 
 QUERY = docker compose exec -T clickhouse clickhouse-client --user tsi --password tsi-local-only --queries-file
 
@@ -22,6 +24,14 @@ demo: up ## start the 17 pairs, watch the guard contain the bad ones, show the a
 	@for t in events guard_actions usage; do docker compose exec -T clickhouse clickhouse-client --user tsi --password tsi-local-only -q "TRUNCATE TABLE tsi.$$t"; done
 	docker compose run --rm launch
 	@$(MAKE) --no-print-directory actions usage
+
+# A recording run. Every rule is in shadow, so the traffic is not shaped by
+# any rule set, and the guard writes each heartbeat to the recording. When
+# the run is over the pairs are removed and the guard goes back to enforcing.
+record: ## record scenarios/NAME.yaml into recordings/NAME.ndjson: make record NAME=default
+	TSI_SHADOW=1 TSI_RECORD=/recordings/$(NAME).ndjson TSI_SCENARIO=/scenarios/$(NAME).yaml $(MAKE) demo
+	@docker compose run --rm launch launch down
+	@$(MAKE) --no-print-directory up
 
 actions: ## the audit trail: every decision the guard made
 	@$(QUERY) /actions.sql

@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -89,6 +91,26 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		// For recording runs: with every rule in shadow the traffic is not
+		// shaped by any rule set, so a replay can compare them fairly.
+		shadow := env("TSI_SHADOW", "") != ""
+		for _, r := range rules.Rules {
+			if shadow {
+				r.Mode = guard.Shadow
+			}
+		}
+		var record io.Writer // stays nil, and nothing is recorded, unless a path is given
+		if path := env("TSI_RECORD", ""); path != "" {
+			f, err := os.Create(path)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			if err := json.NewEncoder(f).Encode(guard.Header{Enforced: !shadow, Tenants: sc.Tenants}); err != nil {
+				return err
+			}
+			record = f
+		}
 		store, err := openStore(c)
 		if err != nil {
 			return err
@@ -99,7 +121,7 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return guard.New(guard.Config{
-			Addr: env("TSI_ADDR", ":8080"), Rules: rules, Tiers: sc.Tiers(), Runtime: docker, Sink: store, Clock: c,
+			Addr: env("TSI_ADDR", ":8080"), Rules: rules, Tiers: sc.Tiers(), Runtime: docker, Sink: store, Record: record, Clock: c,
 		}).Run(ctx)
 	case "fakenet":
 		return fakenet.Run(ctx, env("TSI_ADDR", ":80"))

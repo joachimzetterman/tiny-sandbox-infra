@@ -48,12 +48,17 @@ services:
     user: "0:0"
     environment:
       TSI_CLICKHOUSE_PASSWORD: tsi-local-only
-      TSI_SCENARIO: /scenarios/default.yaml  # for each tenant's tier
+      TSI_SCENARIO: ${TSI_SCENARIO:-/scenarios/default.yaml}  # for each tenant's tier
       TSI_RULES: /rules/a.yaml
+      # Both empty unless `make record` sets them: every rule in shadow, and
+      # every heartbeat written to a recording.
+      TSI_SHADOW: ${TSI_SHADOW:-}
+      TSI_RECORD: ${TSI_RECORD:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./scenarios:/scenarios:ro
       - ./rules:/rules:ro
+      - ./recordings:/recordings
     mem_limit: 128m
     networks: [control, storage]
     depends_on:
@@ -79,7 +84,8 @@ services:
     command: [launch, up]
     user: "0:0"
     environment:
-      TSI_SCENARIO: /scenarios/default.yaml
+      TSI_SCENARIO: ${TSI_SCENARIO:-/scenarios/default.yaml}
+      TSI_WATCH: ${TSI_WATCH:-}  # how long to print the timeline, 70s if empty
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./scenarios:/scenarios:ro
