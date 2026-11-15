@@ -23,7 +23,8 @@ type Sink interface {
 type Config struct {
 	Addr       string
 	Sink       Sink
-	QueueLimit int           // events held in memory, the hard bound
+	QueueLimit int           // events held in memory
+	QueueBytes int           // and their size, whichever is hit first. Zero means 64 MiB.
 	FlushRows  int           // flush as soon as this many are waiting
 	FlushEvery time.Duration // and at least this often
 }
@@ -32,6 +33,7 @@ const (
 	// maxBody must fit one full batch from a proxy, see proxy.New.
 	maxBody       = 16 << 20
 	insertTimeout = 10 * time.Second
+	drainTimeout  = 5 * time.Second // the last flush, inside the 10 s that docker stop allows
 )
 
 type Server struct {
@@ -41,7 +43,10 @@ type Server struct {
 }
 
 func New(cfg Config) *Server {
-	return &Server{cfg: cfg, queue: event.NewQueue(cfg.QueueLimit), kick: make(chan struct{}, 1)}
+	if cfg.QueueBytes == 0 {
+		cfg.QueueBytes = 64 << 20
+	}
+	return &Server{cfg: cfg, queue: event.NewQueue(cfg.QueueLimit, cfg.QueueBytes), kick: make(chan struct{}, 1)}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -61,6 +66,15 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		httpx.Refuse(w, http.StatusBadRequest, event.Malformed, 0)
 		return
 	}
+	// The queue is shared by every tenant and a failed insert is retried,
+	// so an event the store can never take must not get in.
+	for _, e := range in.Events {
+		if !event.Stamped(e) {
+			slog.Warn("refused a batch with an event no proxy would send", "events", len(in.Events))
+			httpx.Refuse(w, http.StatusBadRequest, event.Malformed, 0)
+			return
+		}
+	}
 	// The store is slow or down: push back to the proxy, do not grow.
 	if !s.queue.TryPush(in.Events) {
 		httpx.Refuse(w, http.StatusTooManyRequests, event.BufferFull, time.Second)
@@ -79,9 +93,20 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 
 // Run serves HTTP and flushes until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	go s.flushLoop(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	flushing := make(chan struct{})
+	go func() { s.flushLoop(ctx); close(flushing) }()
 	srv := &http.Server{Addr: s.cfg.Addr, Handler: s.Handler(), ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
-	return httpx.Serve(ctx, srv)
+	err := httpx.Serve(ctx, srv)
+	// The listener is closed, so nothing new can arrive. Proxies already
+	// got a 204 for what is still queued, so write it before the process ends.
+	cancel()
+	<-flushing
+	last, stop := context.WithTimeout(context.Background(), drainTimeout)
+	defer stop()
+	s.flush(last)
+	return err
 }
 
 // flushLoop writes on rows or on time, whichever comes first.

@@ -1,6 +1,8 @@
 # One image for every role. The build stage has the Go toolchain, the final
 # image has only the static binary, so 40 containers stay small.
-FROM golang:1.27-alpine AS build
+# The exact version go.mod asks for. A floating tag can resolve to an older
+# cached image, and the build then stops with "go.mod requires go >= 1.27.4".
+FROM golang:1.27.4-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

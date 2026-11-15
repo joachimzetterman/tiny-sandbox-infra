@@ -18,6 +18,9 @@ import (
 type Refusal struct {
 	Reason            event.Reason `json:"reason"`
 	RetryAfterSeconds int          `json:"retry_after_seconds,omitempty"`
+	// Rejected lists events in the request that would be refused anyway, so
+	// a producer told to retry can fix them first.
+	Rejected []event.Rejected `json:"rejected,omitempty"`
 }
 
 func WriteJSON(w http.ResponseWriter, status int, v any) {
@@ -28,8 +31,8 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 
 // Refuse replies with a reason code. A positive retryAfter also sets the
 // Retry-After header, rounded up so a client never retries too early.
-func Refuse(w http.ResponseWriter, status int, reason event.Reason, retryAfter time.Duration) {
-	body := Refusal{Reason: reason}
+func Refuse(w http.ResponseWriter, status int, reason event.Reason, retryAfter time.Duration, rejected ...event.Rejected) {
+	body := Refusal{Reason: reason, Rejected: rejected}
 	if retryAfter > 0 {
 		body.RetryAfterSeconds = int(math.Ceil(retryAfter.Seconds()))
 		w.Header().Set("Retry-After", strconv.Itoa(body.RetryAfterSeconds))

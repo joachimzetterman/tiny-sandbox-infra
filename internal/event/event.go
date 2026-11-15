@@ -50,6 +50,18 @@ type Batch struct {
 	Events []Event `json:"events"`
 }
 
+// Rejected names one refused event in a batch, by its position.
+type Rejected struct {
+	Index  int    `json:"index"`
+	Reason Reason `json:"reason"`
+}
+
+// Size is roughly the memory one event holds: its strings plus a fixed
+// overhead for the struct. Queues are bounded by it.
+func (e Event) Size() int {
+	return 128 + len(e.EventID) + len(e.TenantID) + len(e.SandboxID) + len(e.Type) + len(e.Payload)
+}
+
 // Check returns the reason an event must be refused, or "" if it is fine.
 func Check(e Event) Reason {
 	if !knownTypes[e.Type] {
@@ -59,6 +71,30 @@ func Check(e Event) Reason {
 		return Oversized
 	}
 	return ""
+}
+
+// Stamped reports whether an event looks like it went through Stamp. Ingest
+// refuses anything else: an event the store can never take would otherwise
+// sit at the head of the shared queue and block every tenant.
+func Stamped(e Event) bool {
+	return Check(e) == "" && e.TenantID != "" && e.SandboxID != "" && !e.EventTime.IsZero() && validID(e.EventID)
+}
+
+// validID checks the UUID layout, which is what the store's column needs.
+func validID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	for i, c := range id {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+		} else if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Stamp replaces everything the sandbox must not control. Whatever identity

@@ -44,6 +44,13 @@ func (b *bucket) take(n int) (ok bool, wait time.Duration) {
 	return false, min(maxRetryAfter, time.Duration(need/b.rate*float64(time.Second)))
 }
 
+// refund gives back tokens taken for events that were then not accepted.
+func (b *bucket) refund(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokens = min(b.burst, b.tokens+float64(n))
+}
+
 // size is the largest batch that can ever be accepted.
 func (b *bucket) size() int {
 	b.mu.Lock()

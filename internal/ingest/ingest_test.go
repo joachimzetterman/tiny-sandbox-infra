@@ -56,10 +56,22 @@ func start(t *testing.T, cfg Config) *Server {
 	return s
 }
 
+var t0 = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+// post sends n events as a proxy would: stamped.
 func post(s *Server, n int) *httptest.ResponseRecorder {
-	body, _ := json.Marshal(event.Batch{Events: make([]event.Event, n)})
+	batch := event.Batch{Events: make([]event.Event, n)}
+	for i := range batch.Events {
+		batch.Events[i] = event.Event{Type: "log", Payload: "hello"}
+		event.Stamp(&batch.Events[i], "t1", "s1", t0)
+	}
+	body, _ := json.Marshal(batch)
+	return postBody(s, string(body))
+}
+
+func postBody(s *Server, body string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/batch", strings.NewReader(string(body))))
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/batch", strings.NewReader(body)))
 	return rec
 }
 
@@ -128,5 +140,49 @@ func TestMalformedBatchIsRefusedWithAReason(t *testing.T) {
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/batch", strings.NewReader("{")))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), string(event.Malformed)) {
 		t.Errorf("got %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestEventTheStoreCannotTakeNeverEntersTheQueue(t *testing.T) {
+	s := New(Config{QueueLimit: 10, FlushRows: 5})
+	for _, body := range []string{
+		`{"events":[{}]}`,
+		`{"events":[{"type":"log","tenant_id":"t1","sandbox_id":"s1","event_time":"2026-01-02T03:04:05Z","event_id":"not-a-uuid"}]}`,
+	} {
+		rec := postBody(s, body)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), string(event.Malformed)) {
+			t.Errorf("%s: got %d %s, want 400 malformed", body, rec.Code, rec.Body)
+		}
+	}
+	// The shared queue is untouched, so other tenants are not held up.
+	if s.queue.Len() != 0 {
+		t.Fatalf("%d poisoned events were queued", s.queue.Len())
+	}
+	if rec := post(s, 10); rec.Code != http.StatusNoContent {
+		t.Errorf("a good batch after the bad ones: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestShutdownWritesWhatIsStillQueued(t *testing.T) {
+	sink := &fakeSink{}
+	// Neither flush trigger can fire, so only the shutdown can write these.
+	s := New(Config{Addr: "127.0.0.1:0", Sink: sink, QueueLimit: 100, FlushRows: 100, FlushEvery: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() { stopped <- s.Run(ctx) }()
+	if rec := post(s, 3); rec.Code != http.StatusNoContent {
+		t.Fatalf("status %d", rec.Code)
+	}
+	cancel()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("ingest stopped with an error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if got := sink.sizes(); len(got) != 1 || got[0] != 3 {
+		t.Errorf("inserts = %v, want the 3 acknowledged rows written on the way out", got)
 	}
 }

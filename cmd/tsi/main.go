@@ -76,7 +76,8 @@ func run(ctx context.Context, args []string) error {
 		}
 		return ingest.New(ingest.Config{
 			Addr: env("TSI_ADDR", ":8080"), Sink: store,
-			QueueLimit: number("TSI_QUEUE_LIMIT", 50000), FlushRows: number("TSI_FLUSH_ROWS", 10000),
+			QueueLimit: number("TSI_QUEUE_LIMIT", 50000), QueueBytes: number("TSI_QUEUE_BYTES", 64<<20),
+			FlushRows:  number("TSI_FLUSH_ROWS", 10000),
 			FlushEvery: duration("TSI_FLUSH_EVERY", time.Second),
 		}).Run(ctx)
 	case "fakenet":
@@ -108,17 +109,18 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-// number and duration fall back on a missing or unparsable value. A typo
-// in a limit then means the default limit, never no limit.
+// number and duration fall back on a missing, unparsable, zero or negative
+// value. A typo in a limit then means the default limit, never no limit and
+// never a crash in a ticker or a queue.
 func number(key string, fallback int) int {
-	if n, err := strconv.Atoi(os.Getenv(key)); err == nil {
+	if n, err := strconv.Atoi(os.Getenv(key)); err == nil && n > 0 {
 		return n
 	}
 	return fallback
 }
 
 func duration(key string, fallback time.Duration) time.Duration {
-	if d, err := time.ParseDuration(os.Getenv(key)); err == nil {
+	if d, err := time.ParseDuration(os.Getenv(key)); err == nil && d > 0 {
 		return d
 	}
 	return fallback

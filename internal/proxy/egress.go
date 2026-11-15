@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"time"
 
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
@@ -18,16 +20,18 @@ import (
 // decides by site class, then either forwards a plain HTTP request or opens
 // a tunnel for HTTPS (CONNECT).
 func (p *Proxy) handleEgress(w http.ResponseWriter, r *http.Request) {
-	host := r.URL.Hostname() // for CONNECT the URL is just "host:port", which parses the same way
+	// For CONNECT the URL is just "host:port", which parses the same way.
+	// DNS names ignore case and a trailing dot, so the lookup must too.
+	host := strings.TrimSuffix(strings.ToLower(r.URL.Hostname()), ".")
 	class, listed := p.classes[host]
 	if !listed {
 		class = scenario.ClassUnlisted
 	}
 	switch class {
 	case scenario.ClassBad:
-		p.block(w, event.SiteBad, host)
+		p.block(w, http.StatusForbidden, event.SiteBad, host)
 	case scenario.ClassUnlisted:
-		p.block(w, event.SiteUnlisted, host)
+		p.block(w, http.StatusForbidden, event.SiteUnlisted, host)
 	default:
 		add := func(n int) {
 			p.count(func(c *Counters) { c.EgressBytes[host] += uint64(n); c.EgressByClass[class] += uint64(n) })
@@ -36,6 +40,13 @@ func (p *Proxy) handleEgress(w http.ResponseWriter, r *http.Request) {
 			p.tunnel(w, r, add)
 			return
 		}
+		if r.ContentLength > maxEgressBody {
+			// Refused before a single byte leaves, and with the real reason.
+			p.block(w, http.StatusRequestEntityTooLarge, event.BodyTooLarge, host)
+			return
+		}
+		// Data can leave in the URL or a header as well as in the body.
+		add(headSize(r))
 		// Bound the whole exchange: request body, reply body and time.
 		ctx, cancel := context.WithTimeout(r.Context(), egressTimeout)
 		defer cancel()
@@ -44,10 +55,22 @@ func (p *Proxy) handleEgress(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *Proxy) block(w http.ResponseWriter, reason event.Reason, host string) {
+// block refuses an outbound call before anything leaves, and counts it.
+func (p *Proxy) block(w http.ResponseWriter, status int, reason event.Reason, host string) {
 	p.count(func(c *Counters) { c.Blocked[reason]++ })
 	slog.Info("egress blocked", "reason", reason, "host", host)
-	httpx.Refuse(w, http.StatusForbidden, reason, 0)
+	httpx.Refuse(w, status, reason, 0)
+}
+
+// headSize is the size of the request line and headers as the sandbox sent them.
+func headSize(r *http.Request) int {
+	n := len(r.Method) + len(r.URL.String())
+	for name, values := range r.Header {
+		for _, v := range values {
+			n += len(name) + len(v)
+		}
+	}
+	return n
 }
 
 // newForwarder builds the plain HTTP path. ReverseProxy from the standard
@@ -62,6 +85,14 @@ func (p *Proxy) newForwarder() *httputil.ReverseProxy {
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			slog.Info("egress failed", "host", r.URL.Hostname(), "err", err)
+			// An upload of unknown length that ran past the limit: the remote
+			// host is fine, and sending the same request again cannot work.
+			var tooBig *http.MaxBytesError
+			if errors.As(err, &tooBig) {
+				p.count(func(c *Counters) { c.Blocked[event.BodyTooLarge]++ })
+				httpx.Refuse(w, http.StatusRequestEntityTooLarge, event.BodyTooLarge, 0)
+				return
+			}
 			httpx.Refuse(w, http.StatusBadGateway, event.UpstreamError, 0)
 		},
 	}

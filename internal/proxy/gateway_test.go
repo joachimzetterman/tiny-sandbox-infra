@@ -133,7 +133,7 @@ func TestBadEventsAreRejectedWithReasonsAndCounted(t *testing.T) {
 	}
 	var reply Accepted
 	_ = json.Unmarshal(rec.Body.Bytes(), &reply)
-	want := []RejectedRow{{Index: 1, Reason: event.UnknownType}, {Index: 2, Reason: event.Oversized}}
+	want := []event.Rejected{{Index: 1, Reason: event.UnknownType}, {Index: 2, Reason: event.Oversized}}
 	if reply.Accepted != 1 || fmt.Sprint(reply.Rejected) != fmt.Sprint(want) {
 		t.Errorf("got %+v, want 1 accepted and %v", reply, want)
 	}
@@ -270,5 +270,95 @@ func TestBucketRefillsAtRateUpToBurst(t *testing.T) {
 	zero := newBucket(fake, 0, 0)
 	if ok, wait := zero.take(1); ok || wait != maxRetryAfter {
 		t.Errorf("zero rate: ok=%v wait=%s, want refusal and the cap", ok, wait)
+	}
+}
+
+func TestFullBufferDoesNotSpendTokens(t *testing.T) {
+	p, _ := newProxy(func(c *Config) { c.QueueLimit = 5 }) // burst 20, and no forwarder running
+	if rec := post(p, events(5)); rec.Code != http.StatusOK {
+		t.Fatalf("first batch refused: %d %s", rec.Code, rec.Body)
+	}
+	for range 3 {
+		if rec := post(p, events(5)); refusal(t, rec).Reason != event.BufferFull {
+			t.Fatalf("got %d %s, want buffer_full", rec.Code, rec.Body)
+		}
+	}
+	// The three refused attempts cost nothing: 15 tokens are still there.
+	p.queue.Drop(5)
+	if rec := post(p, events(5)); rec.Code != http.StatusOK {
+		t.Errorf("after the buffer emptied: got %d %s, want 200", rec.Code, rec.Body)
+	}
+}
+
+func TestRetriedBatchDoesNotInflateRejectCounts(t *testing.T) {
+	p, fake := newProxy(nil)
+	post(p, events(20)) // empties the bucket
+	mixed := `{"events":[{"type":"log"},{"type":"nope"}]}`
+	for range 3 {
+		rec := post(p, mixed)
+		r := refusal(t, rec)
+		if rec.Code != http.StatusTooManyRequests || r.Reason != event.RateLimited {
+			t.Fatalf("got %d %s, want 429 rate_limited", rec.Code, rec.Body)
+		}
+		// The 429 still says which events to fix before retrying.
+		if len(r.Rejected) != 1 || r.Rejected[0] != (event.Rejected{Index: 1, Reason: event.UnknownType}) {
+			t.Fatalf("429 does not name the bad event: %s", rec.Body)
+		}
+	}
+	if c := p.Counters(); c.Rejects[event.UnknownType] != 0 || c.Rejects[event.RateLimited] != 3 {
+		t.Errorf("after three refused attempts: %+v", c.Rejects)
+	}
+	fake.Advance(time.Second)
+	if rec := post(p, mixed); rec.Code != http.StatusOK {
+		t.Fatalf("retry after waiting: %d %s", rec.Code, rec.Body)
+	}
+	if got := p.Counters().Rejects[event.UnknownType]; got != 1 {
+		t.Errorf("bad event counted %d times, want once", got)
+	}
+}
+
+func TestBatchIngestRefusesForGoodIsDroppedAndCounted(t *testing.T) {
+	ingest := newFakeIngest()
+	defer ingest.Close()
+	p, _ := newProxy(func(c *Config) { c.IngestURL = ingest.URL })
+	post(p, events(3))
+
+	// 429 means later: the batch stays.
+	ingest.setStatus(http.StatusTooManyRequests)
+	if p.forwardOnce(context.Background()) || p.queue.Len() != 3 {
+		t.Fatalf("a batch was dropped on 429, queue length %d", p.queue.Len())
+	}
+	// 400 means never: retrying would block the buffer forever.
+	ingest.setStatus(http.StatusBadRequest)
+	if !p.forwardOnce(context.Background()) || p.queue.Len() != 0 {
+		t.Fatalf("a refused batch still blocks the buffer, queue length %d", p.queue.Len())
+	}
+	if got := p.Counters().Dropped; got != 3 {
+		t.Errorf("dropped = %d, want 3", got)
+	}
+}
+
+func TestShutdownHandsOverTheBuffer(t *testing.T) {
+	ingest := newFakeIngest()
+	defer ingest.Close()
+	// The forwarder never ticks, so only the shutdown can deliver these.
+	p, _ := newProxy(func(c *Config) { c.IngestURL, c.ForwardBatch, c.ForwardEvery = ingest.URL, 3, time.Hour })
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() { stopped <- p.serve(ctx, "127.0.0.1:0", "127.0.0.1:0") }()
+	if rec := post(p, events(7)); rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	cancel()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("the proxy stopped with an error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the proxy did not stop after cancel")
+	}
+	if got := len(ingest.received()); got != 7 || p.queue.Len() != 0 {
+		t.Errorf("ingest got %d of 7 accepted events, %d left in the buffer", got, p.queue.Len())
 	}
 }

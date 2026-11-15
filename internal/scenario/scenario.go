@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	"go.yaml.in/yaml/v3"
@@ -40,17 +41,18 @@ const (
 	ClassUnlisted = "unlisted"
 )
 
-// Classes returns a lookup from domain to class.
+// Classes returns a lookup from domain to class. Names are lower case,
+// because that is how the proxy looks them up.
 func (s Sites) Classes() map[string]string {
 	m := map[string]string{}
 	for _, d := range s.Trusted {
-		m[d] = ClassTrusted
+		m[strings.ToLower(d)] = ClassTrusted
 	}
 	for _, d := range s.Watched {
-		m[d] = ClassWatched
+		m[strings.ToLower(d)] = ClassWatched
 	}
 	for _, d := range s.Bad { // last, so a domain listed twice ends up blocked
-		m[d] = ClassBad
+		m[strings.ToLower(d)] = ClassBad
 	}
 	return m
 }

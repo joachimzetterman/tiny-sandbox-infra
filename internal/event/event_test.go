@@ -75,7 +75,7 @@ func TestNewIDIsUUIDv7AndSortsByTime(t *testing.T) {
 }
 
 func TestQueueIsBoundedAndAllOrNothing(t *testing.T) {
-	q := NewQueue(3)
+	q := NewQueue(3, 1<<20)
 	if !q.TryPush(make([]Event, 2)) {
 		t.Fatal("push within the limit was refused")
 	}
@@ -91,5 +91,48 @@ func TestQueueIsBoundedAndAllOrNothing(t *testing.T) {
 	q.Drop(2)
 	if q.Len() != 0 || !q.TryPush(make([]Event, 3)) {
 		t.Fatal("space was not freed by drop")
+	}
+}
+
+func TestQueueIsBoundedInBytesToo(t *testing.T) {
+	big := Event{Type: "log", Payload: strings.Repeat("x", MaxPayloadBytes)}
+	q := NewQueue(1000, 3*big.Size())
+	if !q.TryPush([]Event{big, big, big}) {
+		t.Fatal("push within the byte limit was refused")
+	}
+	if q.TryPush([]Event{{Type: "log"}}) {
+		t.Fatal("push over the byte limit was accepted, although the event limit is far away")
+	}
+	q.Drop(1)
+	if !q.TryPush([]Event{big}) {
+		t.Fatal("bytes were not freed by drop")
+	}
+}
+
+func TestStampedAcceptsOnlyWhatAProxySends(t *testing.T) {
+	good := Event{Type: "log", EventTime: now}
+	Stamp(&good, "t1", "s1", now)
+	if !Stamped(good) {
+		t.Fatalf("a stamped event was refused: %+v", good)
+	}
+	change := map[string]func(*Event){
+		"no tenant":      func(e *Event) { e.TenantID = "" },
+		"no sandbox":     func(e *Event) { e.SandboxID = "" },
+		"no time":        func(e *Event) { e.EventTime = time.Time{} },
+		"no event ID":    func(e *Event) { e.EventID = "" },
+		"ID not a UUID":  func(e *Event) { e.EventID = "mine" },
+		"ID wrong shape": func(e *Event) { e.EventID = strings.Repeat("a", 36) },
+		"unknown type":   func(e *Event) { e.Type = "exploit" },
+		"oversized":      func(e *Event) { e.Payload = strings.Repeat("x", MaxPayloadBytes+1) },
+	}
+	for name, fn := range change {
+		e := good
+		fn(&e)
+		if Stamped(e) {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if Stamped(Event{}) {
+		t.Error("an empty event was accepted")
 	}
 }

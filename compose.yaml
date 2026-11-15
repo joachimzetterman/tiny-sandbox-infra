@@ -29,6 +29,9 @@ services:
     command: [ingest]
     environment:
       TSI_CLICKHOUSE_PASSWORD: tsi-local-only
+      # The queue is bounded at 64 MiB. This tells the Go runtime to collect
+      # garbage harder before the container limit is reached.
+      GOMEMLIMIT: 200MiB
     mem_limit: 256m
     networks: [control, storage]
     depends_on:

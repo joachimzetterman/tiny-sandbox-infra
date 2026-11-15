@@ -36,6 +36,7 @@ type Config struct {
 
 	// Bounds. Zero means the default set in New.
 	QueueLimit   int           // events buffered toward ingest
+	QueueBytes   int           // and their size in memory, whichever is hit first
 	ForwardBatch int           // events per request to ingest
 	ForwardEvery time.Duration // how often the buffer is drained
 }
@@ -48,6 +49,7 @@ const (
 	tunnelLifetime = 60 * time.Second
 	dialTimeout    = 5 * time.Second
 	ingestTimeout  = 2 * time.Second
+	drainTimeout   = 3 * time.Second // inside the 10 s that docker stop allows
 	reportEvery    = 10 * time.Second
 )
 
@@ -71,6 +73,7 @@ type Proxy struct {
 type Counters struct {
 	EventsAccepted uint64
 	BytesAccepted  uint64
+	Dropped        uint64                  // accepted events that ingest refused for good
 	Rejects        map[event.Reason]uint64 // refused events and requests, by reason
 	EgressBytes    map[string]uint64       // bytes both ways, by domain
 	EgressByClass  map[string]uint64       // the same bytes, by site class
@@ -80,6 +83,9 @@ type Counters struct {
 func New(cfg Config) *Proxy {
 	if cfg.QueueLimit == 0 {
 		cfg.QueueLimit = 5000
+	}
+	if cfg.QueueBytes == 0 {
+		cfg.QueueBytes = 8 << 20
 	}
 	if cfg.ForwardBatch == 0 {
 		// 500 events of the largest size, fully JSON-escaped, still fit in
@@ -92,7 +98,7 @@ func New(cfg Config) *Proxy {
 	p := &Proxy{
 		cfg:     cfg,
 		bucket:  newBucket(cfg.Clock, cfg.Rate, cfg.Burst),
-		queue:   event.NewQueue(cfg.QueueLimit),
+		queue:   event.NewQueue(cfg.QueueLimit, cfg.QueueBytes),
 		classes: cfg.Sites.Classes(),
 		ingest:  &http.Client{Timeout: ingestTimeout},
 		dial:    (&net.Dialer{Timeout: dialTimeout}).DialContext,
@@ -150,25 +156,41 @@ func (p *Proxy) reportLoop(ctx context.Context) {
 			return
 		case <-tick.C:
 			c := p.Counters()
-			slog.Info("counters", "events_accepted", c.EventsAccepted, "bytes_accepted", c.BytesAccepted,
+			slog.Info("counters", "events_accepted", c.EventsAccepted, "bytes_accepted", c.BytesAccepted, "dropped", c.Dropped,
 				"rejects", c.Rejects, "egress_by_class", c.EgressByClass, "blocked", c.Blocked)
 		}
 	}
 }
 
-// Run serves both listeners and drains the buffer until ctx is cancelled.
+// Run serves both listeners and forwards the buffer until ctx is cancelled.
 func (p *Proxy) Run(ctx context.Context) error {
-	go p.forwardLoop(ctx) // Go idiom: "go" starts a goroutine; this one ends when ctx is cancelled
+	return p.serve(ctx, net.JoinHostPort(p.cfg.ListenIP, "8080"), net.JoinHostPort(p.cfg.ListenIP, "3128"))
+}
+
+// serve is Run with the two addresses spelled out, so a test can pick free ports.
+func (p *Proxy) serve(ctx context.Context, eventsAddr, egressAddr string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	forwarding := make(chan struct{})
+	// Go idiom: "go" starts a goroutine. This one ends when ctx is cancelled,
+	// and closing the channel tells Run that it has.
+	go func() { p.forwardLoop(ctx); close(forwarding) }()
 	go p.reportLoop(ctx)
 	events := &http.Server{
-		Addr: net.JoinHostPort(p.cfg.ListenIP, "8080"), Handler: p.EventsHandler(),
+		Addr: eventsAddr, Handler: p.EventsHandler(),
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second,
 	}
 	// No write timeout on egress: tunnels are long lived and bounded by
 	// tunnelLifetime instead.
 	egress := &http.Server{
-		Addr: net.JoinHostPort(p.cfg.ListenIP, "3128"), Handler: p.EgressHandler(),
+		Addr: egressAddr, Handler: p.EgressHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	return httpx.Serve(ctx, events, egress)
+	err := httpx.Serve(ctx, events, egress)
+	// The listeners are closed, so nothing new can arrive. Events the
+	// sandbox already got a 200 for are handed over before the process ends.
+	cancel()
+	<-forwarding
+	p.drain()
+	return err
 }

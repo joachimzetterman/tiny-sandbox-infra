@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/scenario"
@@ -60,26 +61,77 @@ func TestTrustedSiteIsForwardedAndCounted(t *testing.T) {
 		t.Fatalf("got %d %q with %d upstream hits", resp.StatusCode, body, hits.Load())
 	}
 	c := p.Counters()
-	if c.EgressBytes["allowed.test"] != uint64(len(body)) || c.EgressByClass[scenario.ClassTrusted] != uint64(len(body)) {
+	if c.EgressBytes["allowed.test"] < uint64(len(body)) || c.EgressByClass[scenario.ClassTrusted] != c.EgressBytes["allowed.test"] {
 		t.Errorf("bytes not counted: %+v", c)
 	}
 }
 
-func TestWatchedSiteIsAllowedAndItsBytesCountedSeparately(t *testing.T) {
+func TestDataInTheURLAndHeadersIsCounted(t *testing.T) {
 	upstream, _ := countingUpstream(t)
 	p, client := egressSetup(t, upstream, testSites)
-	const upload = 200_000
-	resp, err := client.Post("http://paste.test/upload", "application/octet-stream", strings.NewReader(strings.Repeat("s", upload)))
+	req, _ := http.NewRequest(http.MethodGet, "http://paste.test/?q="+strings.Repeat("a", 100_000), nil)
+	req.Header.Set("X-Data", strings.Repeat("b", 200_000))
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	c := p.Counters()
-	if got := c.EgressByClass[scenario.ClassWatched]; got < upload {
-		t.Errorf("watched bytes = %d, want at least the %d uploaded", got, upload)
+	if got := p.Counters().EgressByClass[scenario.ClassWatched]; got < 300_000 {
+		t.Errorf("watched bytes = %d, although 300,000 left in the URL and a header", got)
 	}
-	if c.EgressByClass[scenario.ClassTrusted] != 0 {
-		t.Errorf("watched bytes leaked into the trusted class: %+v", c.EgressByClass)
+}
+
+func TestHostNamesIgnoreCaseAndTrailingDot(t *testing.T) {
+	upstream, hits := countingUpstream(t)
+	p, client := egressSetup(t, upstream, testSites)
+	for _, target := range []string{"http://Allowed.Test/", "http://allowed.test./"} {
+		resp, err := client.Get(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: got %d, want it forwarded", target, resp.StatusCode)
+		}
+	}
+	c := p.Counters()
+	if hits.Load() != 2 || len(c.EgressBytes) != 1 || c.EgressBytes["allowed.test"] == 0 {
+		t.Errorf("%d upstream hits, bytes by domain %v: want 2 hits counted under one name", hits.Load(), c.EgressBytes)
+	}
+}
+
+func TestUploadOverTheLimitIsRefusedAsTooLarge(t *testing.T) {
+	tooBig := strings.Repeat("x", maxEgressBody+10)
+	cases := []struct {
+		name        string
+		body        io.Reader
+		knownLength bool
+	}{
+		{"length known up front", strings.NewReader(tooBig), true},
+		// Wrapping hides the length, so the client streams it in chunks.
+		{"length unknown", io.MultiReader(strings.NewReader(tooBig)), false},
+	}
+	for _, c := range cases {
+		upstream, hits := countingUpstream(t)
+		p, client := egressSetup(t, upstream, testSites)
+		// Expect: 100-continue makes the client wait for the proxy's verdict
+		// before it sends the body, as a careful uploader would.
+		client.Transport.(*http.Transport).ExpectContinueTimeout = 5 * time.Second
+		req, _ := http.NewRequest(http.MethodPost, "http://paste.test/upload", c.body)
+		req.Header.Set("Expect", "100-continue")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		reply, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(string(reply), string(event.BodyTooLarge)) {
+			t.Errorf("%s: got %d %s, want 413 body_too_large", c.name, resp.StatusCode, reply)
+		}
+		// When the length is declared, nothing at all may leave.
+		if got := p.Counters(); c.knownLength && (hits.Load() != 0 || len(got.EgressBytes) != 0 || got.Blocked[event.BodyTooLarge] != 1) {
+			t.Errorf("%s: %d upstream hits, counters %+v: want it refused before anything left", c.name, hits.Load(), got)
+		}
 	}
 }
 
@@ -89,6 +141,8 @@ func TestBadAndUnlistedSitesAreBlockedAndCounted(t *testing.T) {
 		reason event.Reason
 	}{
 		{"http://evil.test/c2", event.SiteBad},
+		{"http://EVIL.TEST/c2", event.SiteBad},  // a bad site stays bad in capitals
+		{"http://evil.test./c2", event.SiteBad}, // and with a trailing dot
 		{"http://never-heard-of-it.test/", event.SiteUnlisted},
 		{"http://10.0.0.5:8123/", event.SiteUnlisted},          // an address is not a listed name
 		{"http://allowed.test.evil.test/", event.SiteUnlisted}, // no suffix or prefix matching
