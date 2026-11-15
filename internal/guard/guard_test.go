@@ -90,7 +90,8 @@ func (h *harness) step(traffic func(id string, sec int) second) {
 		// A copy, as if it had gone over the wire.
 		sent := *c
 		sent.Rejects, sent.EgressByClass, sent.Blocked = copyOf(c.Rejects), copyOf(c.EgressByClass), copyOf(c.Blocked)
-		policy, err := h.g.Heartbeat(control.Heartbeat{TenantID: h.tenant[id], SandboxID: id, Counters: sent})
+		// Like a real proxy, it also reports the policy it was last given.
+		policy, err := h.g.Heartbeat(control.Heartbeat{TenantID: h.tenant[id], SandboxID: id, Counters: sent, Applied: h.policy[id]})
 		if err != nil {
 			h.t.Fatal(err)
 		}
@@ -105,6 +106,10 @@ func copyOf[K comparable](m map[K]uint64) map[K]uint64 {
 	}
 	return out
 }
+
+// restart replaces the guard with one that remembers nothing. The proxies
+// keep their counters and their policies.
+func (h *harness) restart() { h.g = New(h.g.cfg) }
 
 // run steps for a number of seconds with the same traffic function.
 func (h *harness) run(seconds int, traffic func(id string, sec int) second) {
@@ -233,6 +238,7 @@ func TestRulesAreCheckedWhenTheyAreLoaded(t *testing.T) {
 		"an unknown mode":                `{name: a, expr: "true", action: observe, mode: on, ttl: 10s}`,
 		"no ttl":                         `{name: a, expr: "true", action: observe}`,
 		"a rate on something else":       `{name: a, expr: "true", action: kill, rate: 5, ttl: 10s}`,
+		"a throttle without a rate":      `{name: a, expr: "true", action: throttle, ttl: 10s}`,
 		"an unknown key":                 `{name: a, expr: "true", action: observe, ttl: 10s, forr: 1s}`,
 		"the same name twice":            good + "\n  - " + good,
 	}
@@ -323,11 +329,39 @@ func TestSplitFloodIsOnlyVisibleAtTenantLevel(t *testing.T) {
 			t.Errorf("%s: policy is %+v, want %+v: the tenant sends 270/s", id, h.policy[id], want)
 		}
 	}
+	// The tenant's baseline is what its three sandboxes normally send together.
+	if d := h.g.Since(0)[0]; d.Inputs["tenant_baseline_rate"] < 60 || d.Inputs["tenant_baseline_rate"] > 66 {
+		t.Errorf("tenant baseline was %.1f when the rule fired, want about 60", d.Inputs["tenant_baseline_rate"])
+	}
 	// The same sandbox behaviour in a tenant that stays under the tenant limit is fine.
 	if h.policy["d"] != (control.Policy{}) {
 		t.Errorf("a single sandbox at 90/s was acted on: %+v", h.policy["d"])
 	}
 	h.expect("d")
+
+	// One more sandbox, at 90/s from its first second, must not pass for
+	// normal and lift the tenant's baseline to where the flood fits under it.
+	h.add("split", "e")
+	h.run(40, steady(90))
+	for _, id := range []string{"a", "e"} {
+		if !h.policy[id].Throttle {
+			t.Errorf("%s is no longer throttled: a new sandbox diluted the split flood", id)
+		}
+	}
+}
+
+func TestTenantThatStartsManySandboxesAtOnceIsNotASplitFlood(t *testing.T) {
+	h := newHarness(t, readRules(t), map[string]string{"t1": "free"})
+	h.add("t1", "a", "b", "c", "d")
+	// 240/s together from the first second, steadily. That is this tenant's
+	// normal, whichever sandbox the guard happened to hear from first.
+	h.run(120, steady(60))
+	for _, id := range []string{"a", "b", "c", "d"} {
+		h.expect(id)
+	}
+	if b := h.g.sandboxes["a"].baseline.value; b != 60 {
+		t.Errorf("baseline of a is %v, want 60", b)
+	}
 }
 
 func TestSandboxThatWentSilentLeavesItsTenantsTotal(t *testing.T) {
@@ -384,17 +418,36 @@ func TestBlastRadiusCapStopsKillingAndKeepsCheaperActions(t *testing.T) {
 		t.Fatalf("killed %v, want two and then no more", h.runtime.Killed)
 	}
 	for _, id := range []string{"s3", "s4"} {
-		if want := (control.Policy{Throttle: true, EventRate: 10}); h.policy[id] != want {
-			t.Errorf("%s: policy is %+v, want the throttle to keep working", id, h.policy[id])
+		// The throttle keeps working, and a kill that was refused still
+		// stops the outbound calls.
+		if want := (control.Policy{Throttle: true, EventRate: 10, BlockEgress: true}); h.policy[id] != want {
+			t.Errorf("%s: policy is %+v, want %+v", id, h.policy[id], want)
 		}
 		// Refused once and said once, not once per second.
-		h.expect(id, "12s slow-down throttle", "14s stop  (blast_radius_cap)")
+		h.expect(id, "12s slow-down throttle", "14s stop block_egress (blast_radius_cap)")
 	}
 
 	// A minute after the two kills the cap has room again, and the rule still fires.
 	h.run(55, steady(500))
 	if !slices.Equal(h.runtime.Killed, []string{"s1", "s2", "s3", "s4"}) {
 		t.Errorf("killed %v, want the other two once the minute had passed", h.runtime.Killed)
+	}
+}
+
+func TestTwoKillRulesKillASandboxOnce(t *testing.T) {
+	h := newHarness(t, "max_kills_per_minute: 2\nrules:"+`
+  - {name: stop, expr: "offered_rate > 100.0", action: kill, mode: enforce, ttl: 1m}
+  - {name: stop-too, expr: "offered_rate > 100.0", action: kill, mode: enforce, ttl: 1m}`,
+		map[string]string{"t1": "free", "t2": "free"})
+	h.add("t1", "s1")
+	h.add("t2", "s2")
+	h.run(5, steady(500))
+	// One decision, one call to the runtime and one slot of the cap each,
+	// so the cap of two has room for both.
+	h.expect("s1", "3s stop kill")
+	h.expect("s2", "3s stop kill")
+	if !slices.Equal(h.runtime.Killed, []string{"s1", "s2"}) {
+		t.Errorf("killed %v, want [s1 s2]", h.runtime.Killed)
 	}
 }
 
@@ -443,17 +496,53 @@ func TestGuardThatRestartedKeepsWhatTheProxyEnforces(t *testing.T) {
 	h.expect("s1", "0s adopted  (adopted)", "30s adopted  (lifted)")
 }
 
-type brokenRuntime struct{}
+func TestGuardThatRestartedDoesNotTakeAFloodForNormal(t *testing.T) {
+	h := newHarness(t, readRules(t), map[string]string{"single": "free", "split": "free"})
+	h.add("single", "s1")
+	h.add("split", "a", "b", "c")
+	traffic := func(id string, sec int) second {
+		switch {
+		case sec <= 10:
+			return second{accepted: 20}
+		case id == "s1":
+			return second{accepted: 10, rejected: 1990}
+		}
+		return second{accepted: 20, rejected: 70}
+	}
+	h.run(20, traffic)
+	if !h.policy["s1"].NoEvents() || !h.policy["a"].Throttle {
+		t.Fatalf("not contained before the restart: s1 %+v, a %+v", h.policy["s1"], h.policy["a"])
+	}
+	h.restart()
+	// The first thing the new guard sees of s1 is the flood. It must not
+	// become s1's baseline, or "six times the baseline" is never true again.
+	h.run(60, traffic)
+	h.expect("s1", "21s adopted  (adopted)", "24s flood-seen observe", "25s flood throttle",
+		"28s ignores-backpressure  (shadow)", "31s flood-goes-on throttle", "38s flood-never-stops kill")
+	// Long after the adopted policy ran out, the split flood is still held.
+	for _, id := range []string{"a", "b", "c"} {
+		if want := (control.Policy{Throttle: true, EventRate: 20}); h.policy[id] != want {
+			t.Errorf("%s: policy is %+v, want %+v", id, h.policy[id], want)
+		}
+	}
+}
 
-func (brokenRuntime) Kill(context.Context, string) error { return errors.New("docker is down") }
+// brokenRuntime fails every kill and counts how often it was asked.
+type brokenRuntime struct{ asked int }
+
+func (b *brokenRuntime) Kill(context.Context, string) error {
+	b.asked++
+	return errors.New("docker is down")
+}
 
 func TestKillThatFailsLeavesTheSandboxCutOff(t *testing.T) {
 	h := newHarness(t, header+`
   - {name: stop, expr: "offered_rate > 100.0", action: kill, mode: enforce, ttl: 10s}
   - {name: later, expr: "offered_rate > 100.0", for: 20s, action: throttle, rate: 5, mode: enforce, ttl: 10s}`, map[string]string{"t1": "free"})
-	h.g.cfg.Runtime = brokenRuntime{}
+	broken := &brokenRuntime{}
+	h.g.cfg.Runtime = broken
 	h.add("t1", "s1")
-	h.run(60, steady(500)) // far longer than the rule's ttl
+	h.run(60, steady(500)) // far longer than the rule's ttl. The proxy lives, so it keeps reporting.
 	// Killed is final: the rules have nothing more to say about it.
 	h.expect("s1", "3s stop kill")
 	if h.policy["s1"] != control.CutOff {
@@ -461,6 +550,11 @@ func TestKillThatFailsLeavesTheSandboxCutOff(t *testing.T) {
 	}
 	if got := h.g.Denied(); !slices.Equal(got, []string{"s1"}) {
 		t.Errorf("deny list is %v, want [s1]", got)
+	}
+	// Every heartbeat of a killed sandbox says the kill did not take. It is
+	// tried again every retryKill: at 3 s and then five more times.
+	if broken.asked != 6 {
+		t.Errorf("the runtime was asked %d times, want 6", broken.asked)
 	}
 }
 
@@ -486,6 +580,38 @@ func TestGuardRefusesMoreSandboxesThanItCanTrack(t *testing.T) {
 	// The ones it already tracks are still served.
 	if _, err := h.g.Heartbeat(control.Heartbeat{TenantID: "t", SandboxID: "s0"}); err != nil {
 		t.Errorf("a tracked sandbox was refused: %v", err)
+	}
+	// The cap is on sandboxes that are there now, not on all there ever were.
+	h.clk.Advance(forgetAfter)
+	h.g.Sweep()
+	if _, err := h.g.Heartbeat(control.Heartbeat{TenantID: "t", SandboxID: "one-more"}); err != nil {
+		t.Errorf("no room for a new sandbox although the old ones are gone: %v", err)
+	}
+}
+
+func TestSandboxThatIsGoneIsForgottenOnceNothingIsHeldAgainstIt(t *testing.T) {
+	h := newHarness(t, header+`
+  - {name: stop, expr: "offered_rate > 100.0", action: kill, mode: enforce, ttl: 5m}`, map[string]string{"t1": "free"})
+	h.add("t1", "quiet", "loud")
+	h.run(5, func(id string, _ int) second {
+		if id == "loud" {
+			return second{accepted: 500}
+		}
+		return second{accepted: 20}
+	})
+	h.silent["quiet"] = true
+	h.run(90, steady(0)) // loud was killed at 3 s, so nobody reports any more
+	if _, tracked := h.g.sandboxes["quiet"]; tracked {
+		t.Error("a sandbox that has been silent for 90 s is still tracked")
+	}
+	// A kill is remembered for its ttl, so ingest keeps dropping what is
+	// left of the sandbox's events.
+	if got := h.g.Denied(); !slices.Equal(got, []string{"loud"}) {
+		t.Errorf("deny list is %v, want [loud]", got)
+	}
+	h.run(240, steady(0))
+	if n := len(h.g.sandboxes) + len(h.g.order) + len(h.g.tenants); n != 0 {
+		t.Errorf("%d sandboxes and tenants are still in memory, want none", n)
 	}
 }
 

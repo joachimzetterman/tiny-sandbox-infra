@@ -35,7 +35,7 @@ var Variables = []string{
 	"bad_site_attempts",    // calls to bad sites in the window
 	"baseline_rate",        // this sandbox's own normal offered_rate
 	"tenant_offered_rate",  // offered_rate summed over the tenant's sandboxes
-	"tenant_baseline_rate", // the tenant's own normal tenant_offered_rate
+	"tenant_baseline_rate", // baseline_rate summed over the tenant's sandboxes
 	"tenant_sandboxes",     // how many of the tenant's sandboxes are reporting
 }
 
@@ -46,7 +46,7 @@ type Rule struct {
 	Expr   string        `yaml:"expr"`   // CEL, over Variables
 	For    time.Duration `yaml:"for"`    // how long Expr must hold
 	Action string        `yaml:"action"` // a step of the ladder
-	Rate   float64       `yaml:"rate"`   // throttle only: the new events per second
+	Rate   *float64      `yaml:"rate"`   // throttle only, and required there: the new events per second
 	Mode   string        `yaml:"mode"`   // shadow or enforce
 	TTL    time.Duration `yaml:"ttl"`    // the action expires unless the rule still fires
 
@@ -104,8 +104,9 @@ func ParseRules(text []byte) (*RuleSet, error) {
 			return nil, fmt.Errorf("rule %s: mode must be shadow or enforce, got %q", r.Name, r.Mode)
 		case r.For < 0 || r.TTL <= 0:
 			return nil, fmt.Errorf("rule %s: for must not be negative and ttl must be positive", r.Name)
-		case r.Rate < 0 || (r.Rate > 0 && r.Action != Throttle):
-			return nil, fmt.Errorf("rule %s: rate is for throttle only and must not be negative", r.Name)
+		// A pointer, so a rate left out is not read as rate 0, the cut-off.
+		case (r.Rate != nil) != (r.Action == Throttle) || (r.Rate != nil && *r.Rate < 0):
+			return nil, fmt.Errorf("rule %s: throttle needs a rate, nothing else takes one, and it must not be negative", r.Name)
 		}
 		seen[r.Name] = true
 		ast, issues := env.Compile(r.Expr)

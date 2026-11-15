@@ -48,16 +48,18 @@ const (
 	slack        = 500 * time.Millisecond
 	adoptFor     = 30 * time.Second // how long a policy taken over from a proxy is kept
 	killTimeout  = 5 * time.Second
-	maxSandboxes = 10000 // sandboxes tracked. More are refused, not remembered.
-	maxPending   = 20000 // rows waiting for the store
-	keepRecent   = 1000  // decisions kept in memory for the timeline
+	retryKill    = 10 * time.Second // how often a kill that did not take is tried again
+	forgetAfter  = time.Minute      // a sandbox this long silent, with nothing held against it, is forgotten
+	maxSandboxes = 10000            // sandboxes tracked at once. More are refused, not remembered.
+	maxPending   = 20000            // rows waiting for the store
+	keepRecent   = 1000             // decisions kept in memory for the timeline
 )
 
 // What a decision's note can say when the effect is not simply the action.
 const (
 	NoteShadow      = "shadow"             // the rule is in shadow mode, nothing changed
 	NoteApproval    = "approval_requested" // paid tenant: capped at block_egress, a human decides the kill
-	NoteBlastRadius = "blast_radius_cap"   // too many kills this minute, a human is needed
+	NoteBlastRadius = "blast_radius_cap"   // too many kills this minute: capped at block_egress, a human is needed
 	NoteLifted      = "lifted"             // the action expired
 	NoteAdopted     = "adopted"            // taken over from a proxy after a guard restart
 )
@@ -97,7 +99,7 @@ type Guard struct {
 	mu        sync.Mutex // guards everything below
 	tenants   map[string]*tenant
 	sandboxes map[string]*sandbox
-	order     []*sandbox  // every sandbox, in order of first heartbeat
+	order     []*sandbox  // every tracked sandbox, in order of first heartbeat
 	kills     []time.Time // kills in the last minute, for the blast radius cap
 	seq       uint64
 	fresh     []Decision // made by the call in progress
@@ -108,9 +110,8 @@ type Guard struct {
 }
 
 type tenant struct {
-	tier     string
-	members  []*sandbox
-	baseline baseline
+	tier    string
+	members []*sandbox
 }
 
 type sandbox struct {
@@ -122,13 +123,14 @@ type sandbox struct {
 	held         map[string]*held     // rule name to the action it holds
 	firing       bool                 // some rule's expression was true at the last heartbeat
 	killed       bool
+	killTried    time.Time // when the runtime was last asked to kill it
 }
 
 // held is one rule's action on one sandbox.
 type held struct {
 	policy  control.Policy // what it adds to the sandbox's policy. Zero for observe and shadow.
 	expires time.Time
-	refused bool // a kill the blast radius cap did not allow, tried again while the rule fires
+	refused bool // a kill the blast radius cap turned into block_egress, tried again while the rule fires
 }
 
 func New(cfg Config) *Guard {
@@ -154,13 +156,21 @@ func (g *Guard) Heartbeat(hb control.Heartbeat) (control.Policy, error) {
 	} else {
 		g.lost++
 	}
-	if !s.killed {
+	// A heartbeat from a killed sandbox means its proxy is still alive: the
+	// kill did not take, so it is tried again now and then.
+	again := s.killed && now.Sub(s.killTried) >= retryKill
+	if again {
+		s.killTried = now
+	} else if !s.killed {
 		g.evaluate(s, now)
 	}
 	policy, fresh := s.policy(), g.fresh
 	g.fresh = nil
 	g.mu.Unlock()
 	g.act(fresh) // outside the lock: a kill is a slow call
+	if again {
+		g.kill(s.id, slog.With("tenant_id", s.tenantID, "sandbox_id", s.id))
+	}
 	return policy, nil
 }
 
@@ -183,6 +193,10 @@ func (g *Guard) admit(hb control.Heartbeat, now time.Time) *sandbox {
 		// The proxy is enforcing something this guard has no record of, so
 		// the guard restarted. Keep it for a while: a restart must never
 		// loosen a limit. If the cause is still there a rule takes over.
+		// Until the rules have judged the sandbox it counts as firing: what
+		// it does now may be what it was contained for, and that is no
+		// baseline to learn.
+		s.firing = true
 		s.held[NoteAdopted] = &held{policy: hb.Applied, expires: now.Add(adoptFor)}
 		g.record(s, Decision{Rule: NoteAdopted, Mode: Enforce, Note: NoteAdopted, Rate: hb.Applied.EventRate, Expires: now.Add(adoptFor)}, now)
 	}
@@ -196,9 +210,10 @@ func (g *Guard) evaluate(s *sandbox, now time.Time) {
 		return
 	}
 	// The tenant's view: a tenant can spread load over many sandboxes that
-	// each look harmless.
+	// each look harmless. Its baseline is the sum of its sandboxes' own, so
+	// a sandbox that starts or leaves moves the rate and the baseline alike.
 	t := s.tenant
-	tenantRate, reporting, othersFiring := 0.0, 0.0, false
+	tenantRate, tenantBase, reporting, othersFiring := 0.0, 0.0, 0.0, false
 	for _, m := range t.members {
 		if m.killed || now.Sub(m.window.last()) > staleAfter {
 			continue
@@ -207,19 +222,24 @@ func (g *Guard) evaluate(s *sandbox, now time.Time) {
 			tenantRate += mr.offered
 			reporting++
 		}
-		othersFiring = othersFiring || (m != s && m.firing)
+		if m != s {
+			tenantBase += m.baseline.value
+			othersFiring = othersFiring || m.firing
+		}
 	}
-	if s.baseline.at.IsZero() {
+	// A baseline takes in only what no rule objects to, anywhere in the
+	// tenant. Otherwise a flood that lasts long enough becomes the new
+	// normal and the rule that caught it goes quiet. The first window counts
+	// as normal on the same condition. A sandbox without a baseline has
+	// baseline zero, so only the fixed part of a rule can speak for it.
+	if s.baseline.at.IsZero() && !s.firing && !othersFiring {
 		s.baseline.learn(r.offered, now)
-	}
-	if t.baseline.at.IsZero() {
-		t.baseline.learn(tenantRate, now)
 	}
 	vars := map[string]float64{
 		"offered_rate": r.offered, "accepted_rate": r.accepted, "reject_ratio": r.rejectRatio,
 		"egress_bytes_rate": r.egressBytes, "watched_bytes_rate": r.watchedBytes, "bad_site_attempts": r.badSite,
 		"baseline_rate": s.baseline.value, "tenant_offered_rate": tenantRate,
-		"tenant_baseline_rate": t.baseline.value, "tenant_sandboxes": reporting,
+		"tenant_baseline_rate": tenantBase + s.baseline.value, "tenant_sandboxes": reporting,
 	}
 	inputs := map[string]any{"tier": t.tier}
 	for name, v := range vars {
@@ -239,15 +259,12 @@ func (g *Guard) evaluate(s *sandbox, now time.Time) {
 		if now.Sub(s.since[rule.Name])+slack >= rule.For {
 			g.fire(s, rule, vars, now)
 		}
-	}
-	// A baseline learns only from behaviour that no rule objects to.
-	// Otherwise a flood that lasts long enough becomes the new normal and
-	// the rule that caught it goes quiet.
-	if !s.firing {
-		s.baseline.learn(r.offered, now)
+		if s.killed {
+			return // final: no later rule gets to kill it a second time
+		}
 	}
 	if !s.firing && !othersFiring {
-		t.baseline.learn(tenantRate, now)
+		s.baseline.learn(r.offered, now)
 	}
 }
 
@@ -259,16 +276,19 @@ func (g *Guard) fire(s *sandbox, rule *Rule, vars map[string]float64, now time.T
 		h.expires = expires // already in force: the rule still fires, so it stays
 		return
 	}
-	d := Decision{Rule: rule.Name, Mode: rule.Mode, Action: rule.Action, Effect: rule.Action, Rate: rule.Rate, Inputs: vars, Expires: expires}
+	d := Decision{Rule: rule.Name, Mode: rule.Mode, Action: rule.Action, Effect: rule.Action, Inputs: vars, Expires: expires}
+	if rule.Rate != nil {
+		d.Rate = *rule.Rate
+	}
+	// A kill that automation may not carry out becomes block_egress and a
+	// call for a human: the outbound calls stop, the tenant's events are kept.
 	switch {
 	case rule.Mode == Shadow:
 		d.Effect, d.Note = "", NoteShadow
 	case rule.Action == Kill && s.tenant.tier != scenario.TierFree:
-		// Automation never kills a paid tenant's sandbox. It stops the
-		// outbound calls and leaves the kill to a human.
-		d.Effect, d.Note = BlockEgress, NoteApproval
+		d.Effect, d.Note = BlockEgress, NoteApproval // never a paid tenant's sandbox
 	case rule.Action == Kill && !g.mayKill(now):
-		d.Effect, d.Note = "", NoteBlastRadius
+		d.Effect, d.Note = BlockEgress, NoteBlastRadius
 	}
 	if h != nil && d.Note == NoteBlastRadius {
 		h.expires = expires // still over the cap. It was said once, that is enough.
@@ -277,11 +297,11 @@ func (g *Guard) fire(s *sandbox, rule *Rule, vars map[string]float64, now time.T
 	h = &held{expires: expires, refused: d.Note == NoteBlastRadius}
 	switch d.Effect {
 	case Throttle:
-		h.policy = control.Policy{Throttle: true, EventRate: rule.Rate}
+		h.policy = control.Policy{Throttle: true, EventRate: d.Rate}
 	case BlockEgress:
 		h.policy = control.Policy{BlockEgress: true}
 	case Kill:
-		s.killed = true
+		s.killed, s.killTried = true, now
 		g.kills = append(g.kills, now)
 	}
 	s.held[rule.Name] = h
@@ -310,8 +330,9 @@ func (s *sandbox) policy() control.Policy {
 	return p
 }
 
-// Sweep lifts every action whose time is up. It runs on a timer and not on
-// heartbeats, because a sandbox that went silent must be released too.
+// Sweep lifts every action whose time is up and forgets the sandboxes that
+// are gone. It runs on a timer and not on heartbeats, because a sandbox that
+// went silent must be released too.
 func (g *Guard) Sweep() {
 	now := g.cfg.Clock.Now()
 	g.mu.Lock()
@@ -328,6 +349,19 @@ func (g *Guard) Sweep() {
 			}
 		}
 	}
+	// Without this the guard would fill up with sandboxes that no longer
+	// exist. One that comes back is admitted again like a new one.
+	g.order = slices.DeleteFunc(g.order, func(s *sandbox) bool {
+		if len(s.held) > 0 || now.Sub(s.window.last()) < forgetAfter {
+			return false
+		}
+		delete(g.sandboxes, s.id)
+		t := s.tenant
+		if t.members = slices.DeleteFunc(t.members, func(m *sandbox) bool { return m == s }); len(t.members) == 0 {
+			delete(g.tenants, s.tenantID)
+		}
+		return true
+	})
 	fresh := g.fresh
 	g.fresh = nil
 	g.mu.Unlock()
@@ -360,19 +394,23 @@ func (g *Guard) act(fresh []Decision) {
 		case NoteApproval:
 			log.Warn("approval requested: a rule asked to kill a paid tenant's sandbox")
 		case NoteBlastRadius:
-			log.Error("blast radius cap reached, kill refused: a human is needed")
+			log.Error("blast radius cap reached, kill refused and egress blocked: a human is needed")
 		default:
 			log.Info("decision")
 		}
-		if d.Effect != Kill {
-			continue
+		if d.Effect == Kill {
+			g.kill(d.SandboxID, log)
 		}
-		// Not the heartbeat's context: a proxy that hangs up must not cancel its own kill.
-		ctx, cancel := context.WithTimeout(context.Background(), killTimeout)
-		if err := g.cfg.Runtime.Kill(ctx, d.SandboxID); err != nil {
-			log.Error("kill failed, the sandbox stays cut off by its proxy and by ingest", "err", err)
-		}
-		cancel()
+	}
+}
+
+// kill asks the runtime to stop a sandbox and its proxy.
+func (g *Guard) kill(sandboxID string, log *slog.Logger) {
+	// Not the heartbeat's context: a proxy that hangs up must not cancel its own kill.
+	ctx, cancel := context.WithTimeout(context.Background(), killTimeout)
+	defer cancel()
+	if err := g.cfg.Runtime.Kill(ctx, sandboxID); err != nil {
+		log.Error("kill failed, the sandbox stays cut off by its proxy and by ingest", "err", err)
 	}
 }
 
