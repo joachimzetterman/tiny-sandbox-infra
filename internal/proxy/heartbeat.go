@@ -43,7 +43,7 @@ func (p *Proxy) heartbeatLoop(ctx context.Context) {
 // beat sends one heartbeat and returns the policy in the reply.
 func (p *Proxy) beat(ctx context.Context) (policy control.Policy, err error) {
 	body, err := json.Marshal(control.Heartbeat{
-		TenantID: p.cfg.TenantID, SandboxID: p.cfg.SandboxID, Counters: p.Counters(), Applied: p.Policy(),
+		TenantID: p.cfg.TenantID, SandboxID: p.cfg.SandboxID, Started: p.started, Counters: p.Counters(), Applied: p.Policy(),
 	})
 	if err != nil {
 		return policy, err

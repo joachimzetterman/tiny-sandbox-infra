@@ -69,6 +69,8 @@ type Proxy struct {
 	// host name to a local server.
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 
+	started time.Time // when the counters began at zero, sent with every heartbeat
+
 	mu     sync.Mutex // guards c and policy
 	c      control.Counters
 	policy control.Policy // the guard's last word, see heartbeat.go
@@ -100,6 +102,7 @@ func New(cfg Config) *Proxy {
 		ingest:  &http.Client{Timeout: ingestTimeout},
 		guard:   &http.Client{Timeout: guardTimeout},
 		dial:    (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		started: cfg.Clock.Now(),
 		c: control.Counters{
 			Rejects: map[event.Reason]uint64{}, EgressBytes: map[string]uint64{},
 			EgressByClass: map[string]uint64{}, Blocked: map[event.Reason]uint64{},

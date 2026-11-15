@@ -84,6 +84,7 @@ type Usage struct {
 	At        time.Time
 	TenantID  string
 	SandboxID string
+	Started   time.Time // of the proxy: the run of counters these belong to
 	Counters  control.Counters
 }
 
@@ -149,7 +150,7 @@ func (g *Guard) Heartbeat(hb control.Heartbeat) (control.Policy, error) {
 	}
 	s.window.add(now, hb.Counters)
 	if len(g.usage) < maxPending {
-		g.usage = append(g.usage, Usage{At: now, TenantID: s.tenantID, SandboxID: s.id, Counters: hb.Counters})
+		g.usage = append(g.usage, Usage{At: now, TenantID: s.tenantID, SandboxID: s.id, Started: hb.Started, Counters: hb.Counters})
 	} else {
 		g.lost++
 	}

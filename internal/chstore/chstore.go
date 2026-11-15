@@ -79,10 +79,10 @@ func (s *Store) InsertActions(ctx context.Context, rows []guard.Decision) error 
 // InsertUsage writes one row per heartbeat. The values are the proxy's
 // running totals, not the growth since the last row, see schema.sql.
 func (s *Store) InsertUsage(ctx context.Context, rows []guard.Usage) error {
-	return s.insert(ctx, "INSERT INTO usage (tenant_id, sandbox_id, at, events_accepted, bytes_accepted, events_rejected, egress_bytes, watched_bytes, blocked_calls)", len(rows),
+	return s.insert(ctx, "INSERT INTO usage (tenant_id, sandbox_id, proxy_started, at, events_accepted, bytes_accepted, events_rejected, egress_bytes, watched_bytes, blocked_calls)", len(rows),
 		func(i int) []any {
 			u, c := rows[i], rows[i].Counters
-			return []any{u.TenantID, u.SandboxID, u.At, c.EventsAccepted, c.BytesAccepted, control.Total(c.Rejects),
+			return []any{u.TenantID, u.SandboxID, u.Started, u.At, c.EventsAccepted, c.BytesAccepted, control.Total(c.Rejects),
 				control.Total(c.EgressByClass), c.EgressByClass[scenario.ClassWatched], control.Total(c.Blocked)}
 		})
 }

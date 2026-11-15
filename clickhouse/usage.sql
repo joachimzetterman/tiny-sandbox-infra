@@ -1,8 +1,10 @@
 -- Cost per tenant, from the usage table the guard writes. A row holds a
--- sandbox's running totals, so its usage is the largest value seen.
+-- proxy's running totals, so the usage of one run of a proxy is the largest
+-- value seen. A proxy that restarted counts from zero again: that is a new
+-- run (proxy_started), and the runs are added up.
 SELECT
     tenant_id,
-    count()                                AS sandboxes,
+    uniqExact(sandbox_id)                  AS sandboxes,
     sum(events)                            AS events,
     formatReadableSize(sum(bytes))         AS payload,
     sum(rejected)                          AS rejected,
@@ -14,6 +16,7 @@ FROM
     SELECT
         tenant_id,
         sandbox_id,
+        proxy_started,
         max(events_accepted) AS events,
         max(bytes_accepted)  AS bytes,
         max(events_rejected) AS rejected,
@@ -21,7 +24,7 @@ FROM
         max(watched_bytes)   AS watched,
         max(blocked_calls)   AS blocked
     FROM tsi.usage
-    GROUP BY tenant_id, sandbox_id
+    GROUP BY tenant_id, sandbox_id, proxy_started
 )
 GROUP BY tenant_id
 ORDER BY tenant_id

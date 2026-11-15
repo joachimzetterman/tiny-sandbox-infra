@@ -63,7 +63,8 @@ func TestHeartbeatCarriesTheCountersAndBringsBackThePolicy(t *testing.T) {
 	post(p, events(3))
 	eventually(t, "the guard to see the counters", func() bool {
 		hb := guard.heartbeat()
-		return hb.TenantID == "t-real" && hb.SandboxID == "s-real" && hb.Counters.EventsAccepted == 3
+		// Started says which run of the counters this is, for the usage table.
+		return hb.TenantID == "t-real" && hb.SandboxID == "s-real" && hb.Counters.EventsAccepted == 3 && hb.Started.Equal(p.started) && !hb.Started.IsZero()
 	})
 
 	cut := control.Policy{Throttle: true, EventRate: 0, BlockEgress: true}

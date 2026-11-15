@@ -3,7 +3,11 @@
 // deny list ingest fetches.
 package control
 
-import "github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
+import (
+	"time"
+
+	"github.com/joachimzetterman/tiny-sandbox-infra/internal/event"
+)
 
 // Counters only ever go up. A reader that misses a heartbeat loses nothing,
 // because the next one carries the totals.
@@ -53,11 +57,14 @@ func (p Policy) NoEvents() bool { return p.Throttle && p.EventRate <= 0 }
 
 // Heartbeat is what a proxy reports. Applied is the policy it enforces right
 // now, so a guard that restarted with an empty memory can take it over.
+// Started is when the proxy began counting from zero: it tells one run of
+// counters from the next, so usage survives a proxy restart.
 type Heartbeat struct {
-	TenantID  string   `json:"tenant_id"`
-	SandboxID string   `json:"sandbox_id"`
-	Counters  Counters `json:"counters"`
-	Applied   Policy   `json:"applied"`
+	TenantID  string    `json:"tenant_id"`
+	SandboxID string    `json:"sandbox_id"`
+	Started   time.Time `json:"started"`
+	Counters  Counters  `json:"counters"`
+	Applied   Policy    `json:"applied"`
 }
 
 // DenyList names the sandboxes whose events ingest must drop.

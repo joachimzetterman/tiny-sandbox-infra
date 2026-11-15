@@ -52,11 +52,17 @@ TTL toDateTime(at) + INTERVAL 30 DAY;
 -- it already receives. The values are the proxy's running totals, not the
 -- growth since the last row. A guard that was down for a minute then loses
 -- nothing: the next row carries the totals, and only the shape of that
--- minute is gone. Usage for a period is max minus min.
+-- minute is gone.
+--
+-- A proxy that restarts counts from zero again, and proxy_started tells the
+-- two runs apart. Usage is the largest value of each run, added up. For a
+-- period: per run, the largest value in the period minus the largest before
+-- it.
 CREATE TABLE IF NOT EXISTS tsi.usage
 (
     tenant_id       String,
     sandbox_id      String,
+    proxy_started   DateTime64(3, 'UTC'),
     at              DateTime('UTC'),
     events_accepted UInt64,
     bytes_accepted  UInt64,
