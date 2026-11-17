@@ -25,13 +25,20 @@ demo: up ## start the 17 pairs, watch the guard contain the bad ones, show the a
 	docker compose run --rm launch
 	@$(MAKE) --no-print-directory actions usage
 
-# A recording run. Every rule is in shadow, so the traffic is not shaped by
-# any rule set, and the guard writes each heartbeat to the recording. When
-# the run is over the pairs are removed and the guard goes back to enforcing.
+# A recording run. compose.record.yaml puts every rule in shadow, so the
+# traffic is not shaped by any rule set, and has the guard write each
+# heartbeat to NAME.ndjson.part. Only a run that completes, with no gap in
+# the recording, replaces the committed one. It is copied by you and not
+# written by the guard, which runs as root. Whatever happens, the cleanup
+# trap removes the pairs and the guard goes back to enforcing.
+RECORDING = recordings/$(NAME).ndjson
 record: ## record scenarios/NAME.yaml into recordings/NAME.ndjson: make record NAME=default
-	TSI_SHADOW=1 TSI_RECORD=/recordings/$(NAME).ndjson TSI_SCENARIO=/scenarios/$(NAME).yaml $(MAKE) demo
-	@docker compose run --rm launch launch down
-	@$(MAKE) --no-print-directory up
+	@trap 'rm -f $(RECORDING).part; docker compose run --rm launch launch down; $(MAKE) --no-print-directory up' EXIT; \
+	trap 'exit 130' INT TERM; \
+	COMPOSE_FILE=compose.yaml:compose.record.yaml TSI_RECORD=/$(RECORDING).part TSI_SCENARIO=/scenarios/$(NAME).yaml $(MAKE) demo && \
+	docker compose stop guard && \
+	if [ -s $(RECORDING).part ]; then cp $(RECORDING).part $(RECORDING); \
+	else echo "the recording has a gap and was not kept, see: docker compose logs guard" >&2; exit 1; fi
 
 ab: ## replay the committed recordings through rule sets A and B. No Docker needed.
 	@for r in recordings/*.ndjson; do go run ./cmd/tsi ab --recording $$r --a rules/a.yaml --b rules/b.yaml || exit 1; done

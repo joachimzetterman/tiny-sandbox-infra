@@ -2,7 +2,6 @@ package replay
 
 import (
 	"bytes"
-	"encoding/json"
 	"log/slog"
 	"os"
 	"reflect"
@@ -112,11 +111,12 @@ func TestReplayDecidesWhatTheLiveGuardDecided(t *testing.T) {
 		t.Fatal(err)
 	}
 	var tape bytes.Buffer
-	if err := json.NewEncoder(&tape).Encode(guard.Header{Enforced: true, Tenants: sc.Tenants}); err != nil {
+	recorder, err := guard.NewRecorder(&tape, guard.Header{Enforced: true, Tenants: sc.Tenants})
+	if err != nil {
 		t.Fatal(err)
 	}
 	clk := clock.NewFake(start)
-	live := guard.New(guard.Config{Rules: rules(t, rulesA), Tiers: sc.Tiers(), Runtime: &guard.Nothing{}, Record: &tape, Clock: clk})
+	live := guard.New(guard.Config{Rules: rules(t, rulesA), Tiers: sc.Tiers(), Runtime: &guard.Nothing{}, Record: recorder, Clock: clk})
 	totals := map[string]*control.Counters{}
 	const seconds = 100
 	for sec := 1; sec <= seconds; sec++ {
@@ -155,6 +155,9 @@ func TestReplayDecidesWhatTheLiveGuardDecided(t *testing.T) {
 			}
 		}
 	}
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
 	rec, err := Load(&tape)
 	if err != nil {
 		t.Fatal(err)
@@ -164,8 +167,11 @@ func TestReplayDecidesWhatTheLiveGuardDecided(t *testing.T) {
 	}
 	res := Run(rec, rules(t, rulesA))
 	want, got := live.Since(0), res.Decisions
-	if len(want) < 14 || want[len(want)-1].Note != guard.NoteLifted {
-		t.Fatalf("the live guard made %d decisions and the last is %+v: the test should cover a lifted action", len(want), want[len(want)-1])
+	if len(want) < 14 {
+		t.Fatalf("the live guard made %d decisions, want at least 14", len(want))
+	}
+	if last := want[len(want)-1]; last.Note != guard.NoteLifted {
+		t.Fatalf("the live guard's last decision is %+v: the test should cover a lifted action", last)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("replay made %d decisions, the live guard %d, or they differ:\n got %+v\nwant %+v", len(got), len(want), got, want)
@@ -277,15 +283,26 @@ func TestEventsAndEgressAreCountedUnderThePolicyInForce(t *testing.T) {
 	if o.First != time.Second || o.Contained != time.Second || o.ContainedBy != "throttle by `slow`" {
 		t.Errorf("first action after %s, contained after %s by %q, want 1s, 1s, throttle by `slow`", o.First, o.Contained, o.ContainedBy)
 	}
-	// The second that ends at onset passes 20, the first of the flood 100,
-	// and each of the 19 after that the 10 the throttle allows.
-	if o.Passed != 20+100+19*10 {
-		t.Errorf("%d events passed after onset, want 310", o.Passed)
+	// The second that ends at onset passes nothing after onset, the first
+	// of the flood 100, and each of the 19 after that the 10 the throttle
+	// allows.
+	if o.Passed != 100+19*10 {
+		t.Errorf("%d events passed after onset, want 290", o.Passed)
 	}
 	// Egress is 1,000 bytes a second and is blocked from 16 s on.
-	if o.Egress != 7000 {
-		t.Errorf("%d bytes of egress before the block, want 7000", o.Egress)
+	if o.Egress != 6000 {
+		t.Errorf("%d bytes of egress before the block, want 6000", o.Egress)
 	}
+
+	// A behaviour that starts with the sandbox: the first heartbeat covers
+	// the second since the proxy started, and that second counts too.
+	rec.Header.Tenants[0].Sandboxes[0].Start = 0
+	o = Run(rec, parse(t, `
+  - {name: never, expr: "offered_rate < 0.0", action: observe, mode: enforce, ttl: 1m}`)).Outcomes[0]
+	if o.Passed != 30*20+20*80 || o.Egress != 30*1000 {
+		t.Errorf("%d events and %d bytes with nothing in force, want all 2200 and 30000", o.Passed, o.Egress)
+	}
+	rec.Header.Tenants[0].Sandboxes[0].Start = 10 * time.Second
 
 	// A recording that does not say when the proxy started: the first
 	// heartbeat, one second in, stands in for it, so onset moves to 11 s.
@@ -302,11 +319,53 @@ func TestEventsAndEgressAreCountedUnderThePolicyInForce(t *testing.T) {
 	}
 
 	// A rule that acts at 3 s, long before the sandbox misbehaves, is a
-	// false positive and not a fast containment.
+	// false positive. Its throttle is still in force at onset, so it also
+	// contains the flood from the first moment.
 	o = Run(rec, parse(t, `
   - {name: eager, expr: "offered_rate > 5.0", action: throttle, rate: 5, mode: enforce, ttl: 1m}`)).Outcomes[0]
-	if o.Wronged != "throttle by `eager` at 2.0 s" || o.Contained >= 0 {
-		t.Errorf("false positive %q, contained after %s, want the early throttle and never", o.Wronged, o.Contained)
+	held := "throttle by `eager`, held from before onset"
+	if o.Wronged != "throttle by `eager` at 2.0 s" || o.Contained != 0 || o.ContainedBy != held || o.First != 0 || o.FirstBy != held {
+		t.Errorf("false positive %q, contained after %s by %q, first action after %s by %q, want the early throttle, then 0s by %q twice",
+			o.Wronged, o.Contained, o.ContainedBy, o.First, o.FirstBy, held)
+	}
+}
+
+// A recording that ends before some sandboxes misbehave does not score
+// them: they are not misses.
+func TestSandboxesTheRecordingDoesNotReachAreNotScored(t *testing.T) {
+	rec := load(t, "default.ndjson")
+	end := rec.Records[0].At.Add(35 * time.Second) // s14 begins at about 35 s, the split flood at 40
+	for i, r := range rec.Records {
+		if r.At.After(end) {
+			rec.Records = rec.Records[:i]
+			break
+		}
+	}
+	results := [2]*Result{Run(rec, rules(t, rulesA)), Run(rec, rules(t, rulesB))}
+	var report bytes.Buffer
+	Report(&report, "cut", rec, [2]string{rulesA, rulesB}, results)
+	for _, line := range []string{
+		"The recording ends before 4 more begin to misbehave, so they are not scored: s14 (baddest), s15 (flood), s16 (flood), s17 (flood).",
+		"| Misses | 0 | 0 |",
+	} {
+		if !strings.Contains(report.String(), line) {
+			t.Errorf("the report lacks %q:\n%s", line, report.String())
+		}
+	}
+}
+
+// A rule that fails at runtime is taken as false, and the report says so,
+// so a rule that never acts is not mistaken for one that never needed to.
+func TestRuleThatCannotBeEvaluatedIsReported(t *testing.T) {
+	rec := load(t, "mass.ndjson")
+	broken := parse(t, `
+  - {name: broken, expr: "int(offered_rate) / int(tenant_sandboxes - tenant_sandboxes) > 1", action: throttle, rate: 1, mode: enforce, ttl: 1m}`)
+	var report bytes.Buffer
+	Report(&report, "mass", rec, [2]string{"broken", "a"}, [2]*Result{Run(rec, broken), Run(rec, rules(t, rulesA))})
+	for _, line := range []string{"- Rules that could not be evaluated: **`broken` ", "division by zero", "- Rules that could not be evaluated: none"} {
+		if !strings.Contains(report.String(), line) {
+			t.Errorf("the report lacks %q:\n%s", line, report.String())
+		}
 	}
 }
 
@@ -317,19 +376,19 @@ func TestBrokenRecordingIsRefused(t *testing.T) {
 		t.Fatalf("a good recording was refused: %v", err)
 	}
 	for what, text := range map[string]string{
-		"an empty file":        "",
-		"a header and nothing": header,
-		"no header":            record + record,
-		"a line that is cut":   header + record + record[:40],
+		"an empty file":            "",
+		"a header and nothing":     header,
+		"no header":                record + record,
+		"a line that is cut":       header + record + record[:40],
+		"a record with no time":    header + record + `{"tenant_id":"t","sandbox_id":"x"}` + "\n",
+		"a record with no sandbox": header + record + strings.Replace(record, `"sandbox_id":"x"`, `"sandbox_id":""`, 1),
+		// A guard records in the order it judges, by a clock read under its lock.
+		"records out of order": header + strings.Replace(record, "03:04:06", "03:04:09", 1) + record,
+		// A replay steps through every second in between.
+		"a record years later": header + record + strings.Replace(record, "2026-", "2036-", 1),
 	} {
 		if _, err := Load(strings.NewReader(text)); err == nil {
 			t.Errorf("%s was accepted", what)
 		}
-	}
-	// Records out of order are put in order, so time never runs backwards.
-	late := strings.Replace(record, "03:04:06", "03:04:09", 1)
-	rec, err := Load(strings.NewReader(header + late + record))
-	if err != nil || !rec.Records[0].At.Before(rec.Records[1].At) {
-		t.Errorf("records were not sorted by time: %v, %v", rec, err)
 	}
 }

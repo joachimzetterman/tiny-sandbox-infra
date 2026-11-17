@@ -1,0 +1,10 @@
+# Added by `make record` only. Every rule in shadow, so the traffic is not
+# shaped by any rule set, and every heartbeat written to recordings/. Only
+# a recording run can write there.
+services:
+  guard:
+    environment:
+      TSI_SHADOW: "true"
+      TSI_RECORD: ${TSI_RECORD:?set by make record}
+    volumes:
+      - ./recordings:/recordings

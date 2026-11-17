@@ -26,7 +26,10 @@ jobs:
       - name: unit tests
         run: make test
       # No Docker needed. The report also lands on the run's summary page.
+      # bash, not the default sh: it adds pipefail, so a failing replay
+      # fails the step and not only the tee behind it.
       - name: A/B replay of the committed recordings
+        shell: bash
         run: make ab | tee -a "$GITHUB_STEP_SUMMARY"
       # Needs the Docker engine on the runner (28.0 or newer for the
       # isolated gateway mode).

@@ -5,10 +5,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -95,23 +94,24 @@ func run(ctx context.Context, args []string) error {
 		}
 		// For recording runs: with every rule in shadow the traffic is not
 		// shaped by any rule set, so a replay can compare them fairly.
-		shadow := env("TSI_SHADOW", "") != ""
-		for _, r := range rules.Rules {
-			if shadow {
+		// Anything that does not parse as true leaves the rules enforcing.
+		shadow, _ := strconv.ParseBool(env("TSI_SHADOW", "false"))
+		if shadow {
+			for _, r := range rules.Rules {
 				r.Mode = guard.Shadow
 			}
 		}
-		var record io.Writer // stays nil, and nothing is recorded, unless a path is given
-		if path := env("TSI_RECORD", ""); path != "" {
+		var record *guard.Recorder // stays nil, and nothing is recorded, unless a path is given
+		path := env("TSI_RECORD", "")
+		if path != "" {
 			f, err := os.Create(path)
 			if err != nil {
 				return err
 			}
 			defer f.Close()
-			if err := json.NewEncoder(f).Encode(guard.Header{Enforced: !shadow, Tenants: sc.Tenants}); err != nil {
+			if record, err = guard.NewRecorder(f, guard.Header{Enforced: !shadow, Tenants: sc.Tenants}); err != nil {
 				return err
 			}
-			record = f
 		}
 		store, err := openStore(c)
 		if err != nil {
@@ -122,9 +122,18 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return guard.New(guard.Config{
+		err = guard.New(guard.Config{
 			Addr: env("TSI_ADDR", ":8080"), Rules: rules, Tiers: sc.Tiers(), Runtime: docker, Sink: store, Record: record, Clock: c,
 		}).Run(ctx)
+		if record != nil {
+			// A recording with a gap would score rule sets on traffic that
+			// never happened. With the file gone, make record keeps the old one.
+			if gap := record.Close(); gap != nil {
+				_ = os.Remove(path)
+				return errors.Join(err, fmt.Errorf("recording removed: %w", gap))
+			}
+		}
+		return err
 	case "ab":
 		// The one role with flags: it is run by hand, not in a container.
 		flags := flag.NewFlagSet("ab", flag.ContinueOnError)
@@ -133,7 +142,8 @@ func run(ctx context.Context, args []string) error {
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
-		// A replayed guard logs every decision. The report is the output.
+		// A replayed guard logs every decision. The report is the output,
+		// and it lists the rules that could not be evaluated.
 		log := slog.Default()
 		slog.SetDefault(slog.New(slog.DiscardHandler))
 		defer slog.SetDefault(log)

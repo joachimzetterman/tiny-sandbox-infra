@@ -1,4 +1,5 @@
 CLAUDE.local.md
 /bin/
 *.test
+recordings/*.part
 .DS_Store

@@ -3,7 +3,6 @@ package guard
 import (
 	"bytes"
 	"fmt"
-	"log/slog"
 	"os"
 	"time"
 
@@ -124,11 +123,10 @@ func ParseRules(text []byte) (*RuleSet, error) {
 }
 
 // holds reports whether the rule's expression is true for these inputs.
-func (r *Rule) holds(inputs map[string]any) bool {
+func (r *Rule) holds(inputs map[string]any) (bool, error) {
 	out, _, err := r.program.Eval(inputs)
 	if err != nil {
-		slog.Warn("rule could not be evaluated, treating it as false", "rule", r.Name, "err", err)
-		return false
+		return false, err
 	}
-	return out.Value() == true
+	return out.Value() == true, nil
 }

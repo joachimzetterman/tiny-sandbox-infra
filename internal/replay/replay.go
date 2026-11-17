@@ -16,7 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
+	"math"
 	"time"
 
 	"github.com/joachimzetterman/tiny-sandbox-infra/internal/clock"
@@ -30,7 +30,13 @@ type Recording struct {
 	Records []guard.Record // in order of arrival
 }
 
-// Load reads a recording: a header line, then one record per line.
+// maxSpan bounds the recorded time a replay steps through, one sweep per
+// second.
+const maxSpan = 24 * time.Hour
+
+// Load reads a recording: a header line, then one record per line. A guard
+// writes records in the order it judged them, which is also time order.
+// Anything else did not come from a guard, and is refused.
 func Load(r io.Reader) (*Recording, error) {
 	lines := bufio.NewScanner(io.LimitReader(r, guard.MaxRecording+1<<20)) // the cap, and the line that crossed it
 	lines.Buffer(nil, 1<<20)                                               // one line is one heartbeat, far smaller than this
@@ -40,16 +46,23 @@ func Load(r io.Reader) (*Recording, error) {
 	}
 	for lines.Scan() {
 		var record guard.Record
+		n := len(rec.Records)
 		if err := json.Unmarshal(lines.Bytes(), &record); err != nil {
-			return nil, fmt.Errorf("record %d: %w", len(rec.Records)+1, err)
+			return nil, fmt.Errorf("record %d: %w", n+1, err)
+		}
+		switch {
+		case record.At.IsZero() || record.SandboxID == "":
+			return nil, fmt.Errorf("record %d has no time or no sandbox", n+1)
+		case n > 0 && record.At.Before(rec.Records[n-1].At):
+			return nil, fmt.Errorf("record %d is earlier than the one before it", n+1)
+		case n > 0 && record.At.Sub(rec.Records[0].At) > maxSpan:
+			return nil, fmt.Errorf("record %d is more than %s after the first", n+1, maxSpan)
 		}
 		rec.Records = append(rec.Records, record)
 	}
 	if len(rec.Records) == 0 || lines.Err() != nil {
 		return nil, fmt.Errorf("no records, or a line that is too long: %v", lines.Err())
 	}
-	// Already in order when a guard wrote it. Sorting makes that a fact.
-	slices.SortStableFunc(rec.Records, func(a, b guard.Record) int { return a.At.Compare(b.At) })
 	return rec, nil
 }
 
@@ -58,31 +71,42 @@ type Outcome struct {
 	TenantID, Tier string
 	Sandbox        scenario.Sandbox
 	// For a misbehaving sandbox, counted from the moment its behaviour
-	// began. A negative time means it never happened.
-	First, Contained     time.Duration // to the first decision, and to the first that restricts the sandbox
+	// began. A negative time means it never happened. Contained is the
+	// first heartbeat after onset that was answered with a restriction,
+	// whether that was decided then or held from before.
+	First, Contained     time.Duration // to the first action, and to the first that restricts the sandbox
 	FirstBy, ContainedBy string        // what was done and by which rule
 	Passed               uint64        // events let through after onset
 	Egress               uint64        // bytes sent after onset while egress was open
+	// Reached is set when the recording goes on past the sandbox's onset.
+	Reached bool
 	// Wronged is set when the sandbox was restricted while it was well
 	// behaved: a false positive. It says by what.
 	Wronged string
 }
 
+// Misbehaved says the sandbox is a bad one and the recording shows it. A
+// bad sandbox whose behaviour begins after the recording ends is not scored.
+func (o *Outcome) Misbehaved() bool { return o.Sandbox.Bad() && o.Reached }
+
 // Result is one rule set against one recording.
 type Result struct {
 	Outcomes  []*Outcome // one per sandbox, in the order of the scenario
 	Decisions []guard.Decision
-	CapHits   int // kills the blast radius cap refused
+	CapHits   int                      // kills the blast radius cap refused
+	Failures  map[string]guard.Failure // rules that could not be evaluated
 }
 
 // following is what the replay remembers about one sandbox between two of
 // its heartbeats.
 type following struct {
-	out    *Outcome
-	onset  time.Time
-	at     time.Time        // the last heartbeat
-	c      control.Counters // and its counters
-	policy control.Policy   // what the guard answered to it
+	out              *Outcome
+	onset            time.Time
+	at               time.Time        // the last heartbeat, or before the first, when the proxy started
+	c                control.Counters // the counters then
+	policy           control.Policy   // and what the guard answered
+	passed, egress   float64
+	contained, since time.Time // when it was contained, and when the action that did it was taken
 }
 
 // collector is the guard's store during a replay: it keeps the decisions
@@ -128,31 +152,21 @@ func Run(rec *Recording, rules *guard.RuleSet) *Result {
 		if err != nil || f == nil {
 			continue // not in the scenario: judged, but not reported on
 		}
-		switch {
-		case f.at.IsZero():
+		if f.onset.IsZero() {
 			// The behaviour starts at an offset from the sandbox's start,
 			// and the nearest thing on record is when its proxy started.
-			started := hb.Started
-			if started.IsZero() {
-				started = r.At
+			// Its counters started from zero then, with nothing held.
+			f.at = hb.Started
+			if f.at.IsZero() || f.at.After(r.At) {
+				f.at = r.At // not known: the first heartbeat stands in, and what it counted is lost
 			}
-			f.onset = started.Add(f.out.Sandbox.Start)
-		case !r.At.Before(f.onset):
-			// What the policy of the last second would have let through.
-			passed := float64(grown(hb.Counters.EventsAccepted, f.c.EventsAccepted))
-			if f.policy.Throttle {
-				passed = min(passed, f.policy.EventRate*r.At.Sub(f.at).Seconds())
-			}
-			f.out.Passed += uint64(passed)
-			if !f.policy.BlockEgress {
-				f.out.Egress += grown(control.Total(hb.Counters.EgressByClass), control.Total(f.c.EgressByClass))
-			}
+			f.onset = f.at.Add(f.out.Sandbox.Start)
 		}
-		f.at, f.c, f.policy = r.At, hb.Counters, policy
+		f.count(r.At, hb.Counters, policy)
 	}
 	g.Flush(ctx)
+	res.Decisions, res.Failures = sink.decisions, g.Failures()
 
-	res.Decisions = sink.decisions
 	for _, d := range res.Decisions {
 		if d.Note == guard.NoteBlastRadius {
 			res.CapHits++
@@ -168,14 +182,53 @@ func Run(rec *Recording, rules *guard.RuleSet) *Result {
 			if out.First < 0 {
 				out.First, out.FirstBy = since, by
 			}
-			if restricts && out.Contained < 0 {
-				out.Contained, out.ContainedBy = since, by
-			}
 		case restricts && out.Wronged == "":
 			out.Wronged = fmt.Sprintf("%s at %.1f s", by, d.At.Sub(begin).Seconds())
 		}
+		// What contained it: the latest restriction taken by then.
+		if restricts && out.Contained >= 0 && !d.At.After(f.contained) && (out.ContainedBy == "" || d.At.After(f.since)) {
+			out.ContainedBy, f.since = by, d.At
+		}
+	}
+	for _, f := range sandboxes {
+		out := f.out
+		out.Passed, out.Egress = uint64(math.Round(f.passed)), uint64(math.Round(f.egress))
+		if out.Contained >= 0 && f.since.Before(f.onset) {
+			out.ContainedBy += ", held from before onset"
+		}
+		// A restriction already in force at onset is also the first thing
+		// done about the behaviour.
+		if out.Contained >= 0 && (out.First < 0 || out.Contained < out.First) {
+			out.First, out.FirstBy = out.Contained, out.ContainedBy
+		}
 	}
 	return res
+}
+
+// count takes one heartbeat. The traffic since the last one is taken as
+// spread evenly over that interval, and only the part after onset counts:
+// what the policy in force then would have let through.
+func (f *following) count(at time.Time, c control.Counters, policy control.Policy) {
+	from := f.at
+	if from.Before(f.onset) {
+		from = f.onset
+	}
+	if span, after := at.Sub(f.at), at.Sub(from); span > 0 && after > 0 {
+		share := after.Seconds() / span.Seconds()
+		passed := float64(grown(c.EventsAccepted, f.c.EventsAccepted)) * share
+		if f.policy.Throttle {
+			passed = min(passed, f.policy.EventRate*after.Seconds())
+		}
+		f.passed += passed
+		if !f.policy.BlockEgress {
+			f.egress += float64(grown(control.Total(c.EgressByClass), control.Total(f.c.EgressByClass))) * share
+		}
+		f.out.Reached = true
+	}
+	if f.out.Sandbox.Bad() && !at.Before(f.onset) && policy != (control.Policy{}) && f.out.Contained < 0 {
+		f.out.Contained, f.contained = at.Sub(f.onset), at
+	}
+	f.at, f.c, f.policy = at, c, policy
 }
 
 // grown is how much a counter grew. One that went down belongs to a proxy
