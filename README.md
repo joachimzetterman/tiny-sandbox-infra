@@ -2,13 +2,11 @@
 
 A local, reproducible demo of control-plane infrastructure for running untrusted sandboxes for many tiny tenants. It has one idea: a guard that can throttle, cut off or kill a misbehaving sandbox within seconds, and a replay harness that A/B tests guard rules against recorded traffic before they are allowed to enforce.
 
-Design notes: _link to come_
-
-**Status: all three stages are built.** The trust boundary and the data path, the guard, and the recorder with the A/B replay. Everything described below exists and runs.
+**Status: all three stages are built.** The trust boundary and the data path, the guard, and the recorder with the A/B replay. Everything described below exists and runs. Stage 4 of the brief, tenant-scoped reads, is optional and not built.
 
 ## Quickstart
 
-Needs Docker Engine 28 or newer with Compose. Go is only needed to run the tests.
+Needs Docker Engine 28 or newer with Compose. Go is only needed for the tests and `make ab`.
 
 ```
 make up      # build the image, start ClickHouse, ingest, the guard and the fake internet
@@ -352,12 +350,16 @@ and for the guard:
 and for the recorder and the replay:
 
 - every heartbeat is recorded as it arrived, and a recording that fails or reaches its size limit stops without stopping the guard
+- a disk that falls behind is not waited for: the recording stops and says it has a gap
 - replay is deterministic: the same recording gives the same report, byte for byte
 - a live guard that enforces and records, then its recording replayed through the same rules, reach the very same decisions
 - the shipped rule sets on the committed recording: A contains all seven and touches nobody else, B is faster on four, throttles the bursty sandbox and misses the split flood
 - the mass recording reaches the blast radius cap: three kills, two refused
-- events passed and egress before the block, checked on a hand-made recording with round numbers
-- a broken recording is refused
+- events passed and egress before the block, checked on a hand-made recording with round numbers, including the first second of a behaviour that starts with the sandbox
+- an action held from before onset counts as containment, and as a false positive
+- sandboxes whose behaviour begins after the recording ends are not scored as misses
+- a rule that fails at runtime is listed in the report
+- a recording that is cut, out of order, or has a record without a time or a sandbox is refused
 
 `make test-integration` needs a Docker engine. It starts real pairs and proves:
 
