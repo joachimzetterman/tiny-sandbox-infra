@@ -124,7 +124,7 @@ The end of the report (`make ab`, the full report has one table per rule set as 
 | Bad sandboxes contained | 7 of 7 | 4 of 7 |
 | Misses | 0 | 3 |
 | False positives | 0 | 1 |
-| Events passed after onset | 4302 | 7362 |
+| Events passed after onset | 4182 | 7222 |
 | Egress before the block | 3077 KiB | 1028 KiB |
 | Blast radius cap | not reached | not reached |
 ```
@@ -281,9 +281,9 @@ Events and egress are separate controls. When several rules hold an action on on
 
 ### Recorder and replay
 
-**Recording.** With `TSI_RECORD` set, the guard appends every heartbeat it receives to a file, one JSON value per line, with the time it arrived. The first line is the scenario: the ground truth of who misbehaves, how, and from what offset. A recording is bounded at 64 MiB.
+**Recording.** With `TSI_RECORD` set, the guard appends every heartbeat it receives to a file, one JSON value per line, with the time it arrived. The first line is the scenario: the ground truth of who misbehaves, how, and from what offset. A recording is bounded at 64 MiB. The file is written by a goroutine of its own, so a slow disk never holds up the guard. If a write fails, or the disk falls so far behind that a heartbeat would have to wait, the recording has a gap: it stops, and the guard removes the file when it shuts down. The guard goes on either way.
 
-**Shadow while recording.** `make record` runs the demo with every rule forced to shadow (`TSI_SHADOW`). If rules enforced while recording, a killed sandbox would stop sending and a throttled one would look different, so the traffic would already carry the mark of one rule set and the comparison would favour it. A recording made with rules enforcing says so in its header, and the report warns about it.
+**Shadow while recording.** `make record` adds `compose.record.yaml`, which forces every rule to shadow (`TSI_SHADOW`) and is the only place `recordings/` is mounted into the guard. If rules enforced while recording, a killed sandbox would stop sending and a throttled one would look different, so the traffic would already carry the mark of one rule set and the comparison would favour it. A recording made with rules enforcing says so in its header, and the report warns about it.
 
 **Replay.** `tsi ab --recording R --a rules/a.yaml --b rules/b.yaml` feeds the recorded heartbeats to the same guard code that runs live, once per rule set, with the clock set to each heartbeat's recorded time and a runtime that kills nothing. Expired actions are lifted at every whole second of recorded time. Nothing in it depends on the real time or on map order, so the same recording always gives the same report.
 
@@ -292,15 +292,15 @@ Events and egress are separate controls. When several rules hold an action on on
 | Column | Meaning |
 |---|---|
 | First action | The first decision of any kind, `observe` included. |
-| Contained | The first decision that throttles, blocks egress or kills. |
-| Events passed after onset | The events the recorded proxy accepted, cut down to what the replayed policy would have let through in each second. |
-| Egress before the block | The bytes that left while the replayed policy had egress open. |
+| Contained | The first heartbeat after onset that the replayed guard answered with a throttle, an egress block or a kill. An action held from before onset counts: it is then also a false positive. |
+| Events passed after onset | The events the recorded proxy accepted, cut down to what the replayed policy would have let through in each second. Only the part of each heartbeat's interval after onset counts. |
+| Egress before the block | The bytes that left while the replayed policy had egress open, counted the same way. |
 
-plus the misses (never contained), the false positives (a sandbox restricted while it was well behaved) and whether the blast radius cap was reached.
+plus the misses (never contained), the false positives (a sandbox restricted while it was well behaved), whether the blast radius cap was reached, and any rule that could not be evaluated. A bad sandbox whose behaviour begins after the recording ends is listed as not scored, not as a miss.
 
 **Replay is open loop.** The recorded traffic does not react to what a rule set decides. A sandbox that a rule set kills keeps sending in the recording. A sandbox that backs off when throttled does not back off here. So the times to first action and to containment are exact for the recorded traffic, and the two volume columns are estimates.
 
-`make record NAME=default` makes a new recording from `scenarios/NAME.yaml`. It needs Docker.
+`make record NAME=default` makes a new recording from `scenarios/NAME.yaml`. It needs Docker. The guard writes to `recordings/NAME.ndjson.part`, and only a run that completes, with a recording that has no gap, replaces the committed file. If the run fails or is stopped, the pairs are still removed and the guard goes back to enforcing.
 
 ### Network layout
 
