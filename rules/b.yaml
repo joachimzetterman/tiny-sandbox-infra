@@ -1,0 +1,45 @@
+# Rule set B: fixed limits on each sandbox by itself, and no patience.
+#
+# It knows nothing of baselines or tenants, and it acts on the first window
+# that crosses a line. That makes it faster than rule set A on anything
+# loud. It also throttles a legitimate burst, and it cannot see a tenant
+# that spreads a flood over sandboxes which each stay under the line.
+# `make ab` replays a recording through both and shows the difference.
+
+max_kills_per_minute: 3
+
+rules:
+  - name: flood
+    expr: offered_rate > 100.0
+    for: 0s
+    action: throttle
+    rate: 10
+    mode: enforce
+    ttl: 30s
+  - name: flood-goes-on
+    expr: offered_rate > 100.0
+    for: 5s
+    action: throttle
+    rate: 0  # the cut-off
+    mode: enforce
+    ttl: 30s
+  - name: flood-never-stops
+    expr: offered_rate > 100.0
+    for: 10s
+    action: kill
+    mode: enforce
+    ttl: 1m
+
+  - name: exfil
+    expr: watched_bytes_rate > 100000.0
+    for: 0s
+    action: block_egress
+    mode: enforce
+    ttl: 10m
+
+  - name: bad-site
+    expr: bad_site_attempts >= 1.0
+    for: 0s
+    action: kill
+    mode: enforce
+    ttl: 10m

@@ -58,9 +58,9 @@ func (s Sites) Classes() map[string]string {
 }
 
 type Tenant struct {
-	ID        string    `yaml:"id"`
-	Tier      string    `yaml:"tier"` // free or paid
-	Sandboxes []Sandbox `yaml:"sandboxes"`
+	ID        string    `yaml:"id" json:"id"`
+	Tier      string    `yaml:"tier" json:"tier"` // free or paid
+	Sandboxes []Sandbox `yaml:"sandboxes" json:"sandboxes"`
 }
 
 const (
@@ -78,10 +78,10 @@ func (sc *Scenario) Tiers() map[string]string {
 }
 
 type Sandbox struct {
-	ID        string        `yaml:"id"`
-	Behaviour string        `yaml:"behaviour"`
-	Start     time.Duration `yaml:"start"` // the sandbox is normal until this offset
-	Rate      int           `yaml:"rate"`  // events per second once the behaviour starts, 0 for the default
+	ID        string        `yaml:"id" json:"id"`
+	Behaviour string        `yaml:"behaviour" json:"behaviour"`
+	Start     time.Duration `yaml:"start" json:"start"` // the sandbox is normal until this offset. In JSON: nanoseconds.
+	Rate      int           `yaml:"rate" json:"rate"`   // events per second once the behaviour starts, 0 for the default
 }
 
 // Bad is the ground truth: this sandbox is meant to be contained. A bursty

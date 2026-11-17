@@ -129,7 +129,31 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 - **A sandbox silent for a minute, with nothing held against it, is forgotten.** Rejected: remembering every sandbox ever seen: the limit of 10,000 would then fill up for good and every new sandbox would go unjudged and unbilled. A kill is remembered for its `ttl`. A sandbox that comes back is admitted like a new one, and if its proxy still enforces a policy, like one from before a restart.
 - **A store that is down delays the audit trail, not the guard.** Rows wait in memory up to a limit. Rejected: refusing to act without a written record. Every decision is also a log line.
 
-## 20. Small choices
+## 20. Replay drives the real guard
+
+- **Chose:** `tsi ab` creates an ordinary guard, with the clock set from the recording, a runtime that kills nothing and a store that only collects decisions, and feeds it the recorded heartbeats. Sweeps happen at every whole second of recorded time.
+- **Rejected:** a separate evaluator for replay that only runs the rule expressions. It would be smaller, and it would be a second implementation of `for`, `ttl`, baselines, the tier cap and the blast radius cap that could drift from the first.
+- **Why:** the question a replay answers is "what would the guard have done", so it should be the guard that answers. This is what the clock interface, the `Runtime` interface and the optional store were for. A test holds it to that: a live guard and a replay of its own recording must reach identical decisions.
+
+## 21. Recordings are made with every rule in shadow
+
+- **Chose:** `make record` forces all rules to shadow. A recording made with rules enforcing is still accepted, its header says so and the report warns.
+- **Rejected:** recording the normal demo. A sandbox killed by rule set A sends nothing after that, so B could never be seen acting on it later, and a throttled sandbox's counters already show A's throttle. The comparison would favour whichever rule set was live.
+- **Why:** an A/B test needs the same untreated input for both sides. The cost: a recording run contains nothing, so it must not be run against anything real.
+- **A recording with a gap is thrown away.** The guard hands each heartbeat to a writer goroutine through a bounded queue. If a write fails or the queue is full, the recording stops and the file is removed at shutdown. `make record` copies the new file over the committed one only after a run that completed. Rejected: (a) writing under the guard's lock, which makes every heartbeat, kills included, wait on the disk. (b) keeping what was written, which scores rule sets on traffic with a hole in it. (c) a `bufio.Writer` under the lock, which only makes the waits less frequent.
+- **The clock is read under the guard's lock**, so the order heartbeats are recorded in is also the order of their times, and `tsi ab` refuses a recording that is out of order, has a record without a time or a sandbox, or spans more than a day. Rejected: sorting on load, which can put two heartbeats in an order the live guard never judged them in. That order decides which kills the blast radius cap refuses.
+
+## 22. What the replay can and cannot measure
+
+- **Chose:** the time to first action comes from the replayed guard's decisions, the time to containment from the policy it answered each heartbeat with. "Events passed" and "egress before the block" are worked out from the recorded counters and the policy the replayed guard had in force over each second: a throttle caps the events at its rate, a block stops the bytes. A heartbeat's counters are taken as spread evenly over the interval since the one before, and only the part after onset counts.
+- **Rejected:** (a) simulating the sandbox's reaction to a policy. That is a model of the attacker, and the report would then be as good as the model. (b) leaving the volumes out: they are in the brief, and they are what shows that one second sooner matters.
+- **Why:** replay is open loop and says so. The times are facts about the recording, the volumes are labelled as estimates.
+- **Onset comes from the proxy's start time plus the scenario's offset.** The guard never learns when a sandbox started, only launch does. Rejected: having launch tell the guard, which is one more control path for a few tenths of a second of precision that both rule sets lose equally.
+- **"Contained" means the first heartbeat after onset answered with a restriction**, whether the action is new or was held from before. A rule that renews an action writes no decision, so reading containment from decisions alone would call a sandbox throttled since before its flood a miss. Rejected: judging whether the right control was used (a throttle does not stop an upload). The two volume columns already show that.
+- **A bad sandbox whose behaviour begins after the recording ends is not scored.** Rejected: counting it as a miss for both rule sets, which says something about the recording, not the rules.
+- **A rule that fails at runtime is counted, and the report lists it.** Rejected: only logging it, because `tsi ab` discards the guard's logs and the rule would just read as **never**.
+
+## 23. Small choices
 
 
 - **Settings by environment variable**, not flags or config files: it is what a container gets most easily, and a missing, unparsable, zero or negative limit falls back to the default limit, never to no limit or a crash.
@@ -140,3 +164,6 @@ One short entry per real tradeoff: what was chosen, what was rejected, and why.
 - **`for` is compared with half a second of slack.** Heartbeats are a second apart give or take a millisecond, and without slack that millisecond decides whether a rule fires now or a second later.
 - **The guard kills through the launcher's Docker code**, not a client of its own: the code that names and builds a pair is the code that stops it.
 - **The timeline is polled from the guard by `launch`**, not read from ClickHouse: launch is not on the storage network, and it already knows when each behaviour starts.
+- **`tsi ab` takes flags**, the only role that does: it is run by hand, and the brief gives its command line.
+- **A recording is plain NDJSON, one heartbeat per line**, not a compact or compressed format: it can be read with `head` and `jq`, and two committed files of this size do not need more.
+- **Rule set B has no `for`.** That is what makes it fast and what makes it throttle a two-second burst. Its thresholds are the static limits, so it is a fair picture of "just use fixed limits".

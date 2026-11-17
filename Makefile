@@ -2,7 +2,9 @@
 # the engine from the host need its socket spelled out.
 export DOCKER_HOST ?= $(shell docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
 
-.PHONY: up down demo usage actions test test-integration lint
+.PHONY: up down demo record ab usage actions test test-integration lint
+
+NAME ?= default
 
 QUERY = docker compose exec -T clickhouse clickhouse-client --user tsi --password tsi-local-only --queries-file
 
@@ -22,6 +24,24 @@ demo: up ## start the 17 pairs, watch the guard contain the bad ones, show the a
 	@for t in events guard_actions usage; do docker compose exec -T clickhouse clickhouse-client --user tsi --password tsi-local-only -q "TRUNCATE TABLE tsi.$$t"; done
 	docker compose run --rm launch
 	@$(MAKE) --no-print-directory actions usage
+
+# A recording run. compose.record.yaml puts every rule in shadow, so the
+# traffic is not shaped by any rule set, and has the guard write each
+# heartbeat to NAME.ndjson.part. Only a run that completes, with no gap in
+# the recording, replaces the committed one. It is copied by you and not
+# written by the guard, which runs as root. Whatever happens, the cleanup
+# trap removes the pairs and the guard goes back to enforcing.
+RECORDING = recordings/$(NAME).ndjson
+record: ## record scenarios/NAME.yaml into recordings/NAME.ndjson: make record NAME=default
+	@trap 'rm -f $(RECORDING).part; docker compose run --rm launch launch down; $(MAKE) --no-print-directory up' EXIT; \
+	trap 'exit 130' INT TERM; \
+	COMPOSE_FILE=compose.yaml:compose.record.yaml TSI_RECORD=/$(RECORDING).part TSI_SCENARIO=/scenarios/$(NAME).yaml $(MAKE) demo && \
+	docker compose stop guard && \
+	if [ -s $(RECORDING).part ]; then cp $(RECORDING).part $(RECORDING); \
+	else echo "the recording has a gap and was not kept, see: docker compose logs guard" >&2; exit 1; fi
+
+ab: ## replay the committed recordings through rule sets A and B. No Docker needed.
+	@for r in recordings/*.ndjson; do go run ./cmd/tsi ab --recording $$r --a rules/a.yaml --b rules/b.yaml || exit 1; done
 
 actions: ## the audit trail: every decision the guard made
 	@$(QUERY) /actions.sql

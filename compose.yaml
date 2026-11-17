@@ -48,7 +48,7 @@ services:
     user: "0:0"
     environment:
       TSI_CLICKHOUSE_PASSWORD: tsi-local-only
-      TSI_SCENARIO: /scenarios/default.yaml  # for each tenant's tier
+      TSI_SCENARIO: ${TSI_SCENARIO:-/scenarios/default.yaml}  # for each tenant's tier
       TSI_RULES: /rules/a.yaml
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -79,7 +79,8 @@ services:
     command: [launch, up]
     user: "0:0"
     environment:
-      TSI_SCENARIO: /scenarios/default.yaml
+      TSI_SCENARIO: ${TSI_SCENARIO:-/scenarios/default.yaml}
+      TSI_WATCH: ${TSI_WATCH:-}  # how long to print the timeline, 70s if empty
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./scenarios:/scenarios:ro

@@ -1,0 +1,25 @@
+# A mass event: five sandboxes of five free tenants call a known bad site
+# from the same moment. The rules answer that with a kill, and the blast
+# radius cap allows three kills a minute, so this is the scenario where the
+# cap is reached. recordings/mass.ndjson was made from it.
+
+subnet: 10.77.0.0/16
+
+limits:
+  events_per_sec: 100
+  burst: 200
+
+sites:
+  trusted: [allowed.test]
+  watched: [paste.test]
+  bad: [evil.test]
+
+tenants:
+  - {id: m01, tier: free, sandboxes: [{id: q01, behaviour: normal}]}
+  - {id: m02, tier: free, sandboxes: [{id: q02, behaviour: normal}]}
+  - {id: m03, tier: paid, sandboxes: [{id: q03, behaviour: normal}]}
+  - {id: m04, tier: free, sandboxes: [{id: q04, behaviour: baddest, start: 8s}]}
+  - {id: m05, tier: free, sandboxes: [{id: q05, behaviour: baddest, start: 8s}]}
+  - {id: m06, tier: free, sandboxes: [{id: q06, behaviour: baddest, start: 8s}]}
+  - {id: m07, tier: free, sandboxes: [{id: q07, behaviour: baddest, start: 8s}]}
+  - {id: m08, tier: free, sandboxes: [{id: q08, behaviour: baddest, start: 8s}]}

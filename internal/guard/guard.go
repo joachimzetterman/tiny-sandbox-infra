@@ -1,7 +1,7 @@
 // Package guard watches every sandbox through its proxy's heartbeats and
 // contains the ones that misbehave. window.go turns counters into rates,
-// rules.go holds the rule language, this file decides, and server.go is the
-// HTTP and storage around it.
+// rules.go holds the rule language, this file decides, server.go is the
+// HTTP and storage around it, and recorder.go keeps what it saw for replay.
 package guard
 
 import (
@@ -37,7 +37,8 @@ type Config struct {
 	Rules   *RuleSet
 	Tiers   map[string]string // tenant to tier
 	Runtime Runtime
-	Sink    Sink // may be nil: nothing is stored
+	Sink    Sink      // may be nil: nothing is stored
+	Record  *Recorder // may be nil: nothing is recorded. See recorder.go.
 	Clock   clock.Clock
 }
 
@@ -93,6 +94,13 @@ type Usage struct {
 // ErrFull means the guard cannot track one more sandbox.
 var ErrFull = errors.New("guard is tracking as many sandboxes as it can")
 
+// Failure is a rule that could not be evaluated: how often, and why the
+// last time. Each time it was taken as false.
+type Failure struct {
+	Count int
+	Err   string
+}
+
 type Guard struct {
 	cfg Config
 
@@ -102,11 +110,12 @@ type Guard struct {
 	order     []*sandbox  // every tracked sandbox, in order of first heartbeat
 	kills     []time.Time // kills in the last minute, for the blast radius cap
 	seq       uint64
-	fresh     []Decision // made by the call in progress
-	recent    []Decision // the last keepRecent, for the timeline
-	actions   []Decision // waiting for the store
-	usage     []Usage    // waiting for the store
-	lost      int        // rows dropped because the store fell behind
+	fresh     []Decision         // made by the call in progress
+	recent    []Decision         // the last keepRecent, for the timeline
+	actions   []Decision         // waiting for the store
+	usage     []Usage            // waiting for the store
+	lost      int                // rows dropped because the store fell behind
+	failures  map[string]Failure // rule name to its evaluation failures
 }
 
 type tenant struct {
@@ -134,14 +143,16 @@ type held struct {
 }
 
 func New(cfg Config) *Guard {
-	return &Guard{cfg: cfg, tenants: map[string]*tenant{}, sandboxes: map[string]*sandbox{}}
+	return &Guard{cfg: cfg, tenants: map[string]*tenant{}, sandboxes: map[string]*sandbox{}, failures: map[string]Failure{}}
 }
 
 // Heartbeat takes one report from a proxy, judges the sandbox and returns
 // the policy the proxy must enforce from now on.
 func (g *Guard) Heartbeat(hb control.Heartbeat) (control.Policy, error) {
-	now := g.cfg.Clock.Now()
 	g.mu.Lock()
+	// Read under the lock, so the order heartbeats are judged and recorded
+	// in is also the order of their times.
+	now := g.cfg.Clock.Now()
 	s := g.sandboxes[hb.SandboxID]
 	if s == nil {
 		if len(g.order) >= maxSandboxes {
@@ -151,6 +162,9 @@ func (g *Guard) Heartbeat(hb control.Heartbeat) (control.Policy, error) {
 		s = g.admit(hb, now)
 	}
 	s.window.add(now, hb.Counters)
+	if g.cfg.Record != nil {
+		g.cfg.Record.add(Record{At: now, Heartbeat: hb})
+	}
 	if len(g.usage) < maxPending {
 		g.usage = append(g.usage, Usage{At: now, TenantID: s.tenantID, SandboxID: s.id, Started: hb.Started, Counters: hb.Counters})
 	} else {
@@ -248,7 +262,13 @@ func (g *Guard) evaluate(s *sandbox, now time.Time) {
 
 	s.firing = false
 	for _, rule := range g.cfg.Rules.Rules {
-		if !rule.holds(inputs) {
+		holds, err := rule.holds(inputs)
+		if err != nil {
+			// Counted, so a replay can say why a rule never acted.
+			g.failures[rule.Name] = Failure{Count: g.failures[rule.Name].Count + 1, Err: err.Error()}
+			slog.Warn("rule could not be evaluated, treating it as false", "rule", rule.Name, "err", err)
+		}
+		if !holds {
 			delete(s.since, rule.Name)
 			continue
 		}
@@ -334,8 +354,8 @@ func (s *sandbox) policy() control.Policy {
 // are gone. It runs on a timer and not on heartbeats, because a sandbox that
 // went silent must be released too.
 func (g *Guard) Sweep() {
-	now := g.cfg.Clock.Now()
 	g.mu.Lock()
+	now := g.cfg.Clock.Now() // under the lock, like a heartbeat's
 	for _, s := range g.order {
 		// Sorted, so the same input always gives the same audit trail.
 		for _, name := range slices.Sorted(maps.Keys(s.held)) {
@@ -366,6 +386,13 @@ func (g *Guard) Sweep() {
 	g.fresh = nil
 	g.mu.Unlock()
 	g.act(fresh)
+}
+
+// Failures is every rule that could not be evaluated so far, by name.
+func (g *Guard) Failures() map[string]Failure {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return maps.Clone(g.failures)
 }
 
 // record adds a decision to the audit trail. The caller holds mu.

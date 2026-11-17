@@ -1,6 +1,6 @@
 # Plan
 
-Status: approved. Stage 1 is merged, stage 2 is delivered for review, stage 3 is not started.
+Status: approved. Stages 1 and 2 are merged, stage 3 is delivered for review.
 
 This file is the plan agreed before stage 1. The original brief is [SPEC.md](SPEC.md). Once code exists, `DECISIONS.md` is the source of truth for tradeoffs.
 
